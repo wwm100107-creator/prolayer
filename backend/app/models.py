@@ -178,10 +178,30 @@ class Engine:
         progress: Callable[[float], None] = lambda value: None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Prompt a point grid; returns (N x 256 x 256 logits, N scores, N point ids)."""
-        sam = self._load_sam()
         step = SAM_SIZE / GRID_SIDE
         axis = torch.arange(GRID_SIDE, dtype=torch.float32, device=self.device) * step + step / 2
         grid = torch.cartesian_prod(axis, axis)
+        # Cheap first cut; most of the ~3000 masks are junk or duplicates.
+        return self._decode_points(embeddings, grid, 0.6, progress)
+
+    @torch.inference_mode()
+    def candidates_at(
+        self, rgb: np.ndarray, embeddings: list[torch.Tensor], points: Sequence[tuple[float, float]]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Three candidate masks for each (x, y) image point, in the same format."""
+        height, width = rgb.shape[:2]
+        scale = torch.tensor([SAM_SIZE / width, SAM_SIZE / height], device=self.device)
+        xy = torch.tensor(points, dtype=torch.float32, device=self.device) * scale
+        return self._decode_points(embeddings, xy, 0.0)
+
+    def _decode_points(
+        self,
+        embeddings: list[torch.Tensor],
+        grid: torch.Tensor,
+        min_score: float,
+        progress: Callable[[float], None] = lambda value: None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        sam = self._load_sam()
         kept_logits, kept_scores, kept_points = [], [], []
         total = len(grid)
         features = self._to_gpu(embeddings)
@@ -197,8 +217,7 @@ class Engine:
             logits = output.pred_masks[0].flatten(0, 1).float()
             scores = output.iou_scores[0].flatten().float()
             point_ids = torch.arange(start, start + len(batch), device=self.device).repeat_interleave(3)
-            # Cheap first cut; most of the ~3000 masks are junk or duplicates.
-            keep = scores >= 0.6
+            keep = scores >= min_score
             kept_logits.append(logits[keep].cpu().numpy())
             kept_scores.append(scores[keep].cpu().numpy())
             kept_points.append(point_ids[keep].cpu().numpy())

@@ -1,6 +1,7 @@
 """Finds text, rebuilds each line as an editable layer, erases it from the picture."""
 from __future__ import annotations
 
+import logging
 import math
 import os
 from pathlib import Path
@@ -13,7 +14,10 @@ from PIL import Image, ImageDraw, ImageFont
 from .models import engine
 from .pipeline import Layer, _bbox, _dilate, _pad_box, _trim, inpaint_region
 
+log = logging.getLogger("prolayer")
+
 MIN_CONFIDENCE = 0.4
+MIN_INK_OVERLAP = 0.55
 MIN_LINE_HEIGHT = 10
 MIN_CONTRAST = 40.0
 MAX_TEXT_LAYERS = 60
@@ -66,16 +70,16 @@ def _render_ink(font: ImageFont.FreeTypeFont, text: str) -> tuple[np.ndarray, in
     return ink[y0:y1, x0:x1], x0 - origin[0], y1 - origin[1]
 
 
-def match_font(ink: np.ndarray, text: str) -> tuple[Font, float, float, float]:
+def match_font(ink: np.ndarray, text: str) -> tuple[Font, float, float, float, float]:
     """Best installed font for this line of ink.
 
-    Returns (font, size, x, y) with x/y the baseline start in `ink` coordinates.
-    Each candidate is sized to the width of the ink, then scored on overlap.
+    Returns (font, size, x, y, overlap) with x/y the baseline start in `ink`
+    coordinates. Each candidate is sized to the width of the ink, then scored.
     """
     x0, y0, x1, y1 = _bbox(ink)
     width, height = x1 - x0, y1 - y0
     target = ink[y0:y1, x0:x1]
-    best: tuple[float, Font, float, float, float] | None = None
+    best: tuple[float, Font, float, float, float, float] | None = None
     for candidate in FONTS:
         path = FONT_DIR / candidate.file
         if not path.exists():
@@ -93,10 +97,10 @@ def match_font(ink: np.ndarray, text: str) -> tuple[Font, float, float, float]:
         # Overlap alone favours wrong fonts stretched into the right box.
         score = overlap - 0.5 * abs(math.log(glyphs.shape[0] / height))
         if best is None or score > best[0]:
-            best = (score, candidate, size, x0 - bearing, y1 - descent)
+            best = (score, candidate, size, x0 - bearing, y1 - descent, float(overlap))
     if best is None:  # no known font on this machine: estimate from the ink
-        return FONTS[0], height / 0.72, float(x0), float(y1)
-    return best[1], best[2], best[3], best[4]
+        return FONTS[0], height / 0.72, float(x0), float(y1), 1.0
+    return best[1], best[2], best[3], best[4], best[5]
 
 
 def _separate(crop: np.ndarray, rim: int) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
@@ -154,7 +158,12 @@ def extract_text(rgb: np.ndarray) -> tuple[list[Layer], np.ndarray]:
         if not (alpha > 0.5).any():
             continue
 
-        font, font_size, baseline_x, baseline_y = match_font(alpha > 0.5, content)
+        font, font_size, baseline_x, baseline_y, overlap = match_font(alpha > 0.5, content)
+        # Misread words and display fonts render nothing like the ink. Replacing
+        # them would corrupt the picture, so they stay graphics for the segmenter.
+        if overlap < MIN_INK_OVERLAP:
+            log.info("Keeping %r as a graphic: rendered ink overlap %.2f", content, overlap)
+            continue
         inverse = np.linalg.inv(forward)
         origin = cv2.perspectiveTransform(np.array([[[baseline_x, baseline_y]]], np.float32), inverse)[0, 0]
         angle = math.degrees(math.atan2(float(quad[1][1] - quad[0][1]), float(quad[1][0] - quad[0][0])))

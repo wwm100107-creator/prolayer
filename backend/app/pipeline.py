@@ -29,6 +29,34 @@ BACKGROUND_AREA = 0.6
 # Mean absolute Laplacian below which a surface counts as flat colour or gradient.
 SMOOTH_DETAIL = 2.0
 SMOOTH_FILL_SIDE = 1024
+# Lab distance within which a pixel still counts as the plain page.
+PAGE_COLOUR_DISTANCE = 7.0
+
+# Finding what the point grid missed.
+GAP_ROUNDS = 6
+SHADOW_CLEARANCE = 12
+MAX_GAP_LAYERS = 24
+GAP_MARGIN = 2
+GAP_MIN_AREA = 0.001
+SHAPE_EDGE = 6.0
+SHAPE_SAME_COLOUR = 4.0
+PAGE_EDGE = 3.0
+# Drawn art has crisp edges, so the matting band can be much narrower.
+FLAT_EDGE_SCALE = 0.4
+CRUMB_MIN_PIXELS = 16
+GAP_MIN_SCORE = 0.5
+GAP_MIN_NEW = 0.6
+GAP_MAX_PAGE = 0.1
+
+# What a run of letters looks like, relative to its line height.
+GLYPH_MIN_HEIGHT = 12
+GLYPH_MAX_ASPECT = 2.5
+GLYPH_MIN_HEIGHT_RATIO = 0.6
+GLYPH_TOP_ALIGN = 0.45
+GLYPH_BASE_ALIGN = 0.15
+GLYPH_MAX_GAP = 0.35
+WORD_MAX_GAP = 0.8
+GLYPH_COLOUR_DISTANCE = 12.0
 
 
 @dataclass
@@ -365,6 +393,196 @@ def _upsample(logits: np.ndarray, width: int, height: int) -> np.ndarray:
     return cv2.resize(logits, (width, height), interpolation=cv2.INTER_LINEAR) > 0
 
 
+def _colour_edges(rgb: np.ndarray) -> np.ndarray:
+    """Strongest change per pixel across the three Lab channels."""
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    return np.max(np.abs(cv2.Sobel(lab, cv2.CV_32F, 1, 0, ksize=3)) + np.abs(cv2.Sobel(lab, cv2.CV_32F, 0, 1, ksize=3)), axis=2) / 8
+
+
+def _find_page(rgb: np.ndarray, logits: np.ndarray, scores: np.ndarray) -> np.ndarray | None:
+    """The plain surface a design sits on, or None for a photographic scene.
+
+    Grown by colour so that thin slivers SAM left out still count as surface.
+    """
+    height, width = rgb.shape[:2]
+    masks = logits > 0
+    size = masks.shape[-1]
+    perimeter = (
+        masks[:, 0, :].sum(1) + masks[:, -1, :].sum(1) + masks[:, :, 0].sum(1) + masks[:, :, -1].sum(1)
+    ) / (4.0 * size)
+    surfaces = np.flatnonzero(perimeter >= BACKGROUND_PERIMETER)
+    if not len(surfaces):
+        return None
+    area = masks[surfaces].sum(axis=(1, 2))
+    page = _upsample(logits[surfaces[int(np.argmax(area * scores[surfaces]))]], width, height)
+    # SAM often lumps pale shapes in with the page, but a drawn edge separates them.
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (page & (_colour_edges(rgb) < PAGE_EDGE)).astype(np.uint8), connectivity=4
+    )
+    border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    keep = np.zeros(count, bool)
+    keep[border[border > 0]] = True
+    keep &= stats[:, cv2.CC_STAT_AREA] >= 0.02 * height * width
+    page = keep[labels]
+    core = ~_dilate(~page, 3)
+    if not core.any():
+        return None
+    detail = np.abs(cv2.Laplacian(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), cv2.CV_32F))
+    if float(detail[core].mean()) >= SMOOTH_DETAIL:
+        return None
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    surface = cv2.cvtColor(_smooth_fill(rgb, core), cv2.COLOR_RGB2LAB)
+    difference = np.linalg.norm(lab.astype(np.float32) - surface.astype(np.float32), axis=2)
+    return difference <= PAGE_COLOUR_DISTANCE
+
+
+def _flat_shapes(rgb: np.ndarray, region: np.ndarray, min_pixels: int) -> list[np.ndarray]:
+    """Cuts a leftover region along its colour edges, for drawn art SAM cannot outline."""
+    flat = region & (_colour_edges(rgb) < SHAPE_EDGE)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(flat.astype(np.uint8), connectivity=4)
+    shapes = [labels == label for label in range(1, count) if stats[label, cv2.CC_STAT_AREA] >= min_pixels]
+    # The anti-aliased rim that was cut away goes back to the shape it surrounds.
+    return [_dilate(shape, 2) & region for shape in shapes] or [region]
+
+
+def _fill_gaps(
+    rgb: np.ndarray, embeddings, selected: list[np.ndarray], page: np.ndarray, min_pixels: int
+) -> list[np.ndarray]:
+    """Masks for whatever is neither surface nor an element yet.
+
+    The grid can miss an object whose masks all look uncertain. Prompting at the
+    middle of each leftover region finds it, so nothing stays baked into the
+    background. What SAM cannot outline is cut along its colour edges instead,
+    and any crumbs left at the end share one layer.
+    """
+    height, width = rgb.shape[:2]
+    covered = np.logical_or.reduce(selected) if selected else np.zeros((height, width), bool)
+    # The margin absorbs the slivers along SAM's slightly-off outlines.
+    residual = ~page & ~_dilate(covered, GAP_MARGIN)
+    added: list[np.ndarray] = []
+    shapes: list[np.ndarray] = []
+
+    for _ in range(GAP_ROUNDS):
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(residual.astype(np.uint8), connectivity=8)
+        regions = [label for label in range(1, count) if stats[label, cv2.CC_STAT_AREA] >= min_pixels]
+        regions = sorted(regions, key=lambda label: -stats[label, cv2.CC_STAT_AREA])[
+            : MAX_GAP_LAYERS - len(added) - len(shapes)
+        ]
+        if not regions:
+            break
+        points = []
+        for label in regions:
+            # The deepest point cannot fall on the region's edge.
+            depth = cv2.distanceTransform((labels == label).astype(np.uint8), cv2.DIST_L2, 5)
+            y, x = np.unravel_index(int(np.argmax(depth)), depth.shape)
+            points.append((float(x), float(y)))
+        logits, scores, point_ids = engine.candidates_at(rgb, embeddings, points)
+
+        for point, label in enumerate(regions):
+            region = labels == label
+            best: np.ndarray | None = None
+            indices = np.flatnonzero(point_ids == point)
+            for index in indices[np.argsort(-(logits[indices] > 0).sum(axis=(1, 2)))]:
+                if scores[index] < GAP_MIN_SCORE:
+                    continue
+                mask = _upsample(logits[index], width, height)
+                area = int(mask.sum())
+                if area < min_pixels:
+                    continue
+                if (mask & residual).sum() >= GAP_MIN_NEW * area and (mask & page).sum() <= GAP_MAX_PAGE * area:
+                    best = mask
+                    break
+            if best is not None:
+                added.append(best)
+                residual &= ~best
+            else:
+                shapes += _flat_shapes(rgb, region, min_pixels)
+                residual &= ~region
+        if len(added) + len(shapes) >= MAX_GAP_LAYERS:
+            break
+    return added + _merge_same_colour(rgb, shapes)
+
+
+def _merge_same_colour(rgb: np.ndarray, shapes: list[np.ndarray]) -> list[np.ndarray]:
+    """One shape that objects on top cut into pieces becomes one layer again."""
+    if len(shapes) < 2:
+        return shapes
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    merged: list[tuple[np.ndarray, np.ndarray]] = []
+    for shape in sorted(shapes, key=lambda mask: -int(mask.sum())):
+        colour = np.median(lab[shape], axis=0)
+        for index, (mask, seen) in enumerate(merged):
+            if float(np.linalg.norm(colour - seen)) <= SHAPE_SAME_COLOUR:
+                merged[index] = (mask | shape, seen)
+                break
+        else:
+            merged.append((shape, colour))
+    return [mask for mask, _ in merged]
+
+
+def _crumbs(page: np.ndarray, visible: list[np.ndarray]) -> np.ndarray | None:
+    """Strokes and specks too small to stand alone, kept off the background."""
+    leftovers = ~page & ~_dilate(np.logical_or.reduce(visible), GAP_MARGIN)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(leftovers.astype(np.uint8), connectivity=8)
+    keep = stats[:, cv2.CC_STAT_AREA] >= CRUMB_MIN_PIXELS
+    keep[0] = False
+    return keep[labels] if keep.any() else None
+
+
+def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.ndarray]:
+    """Joins glyphs that SAM outlined one by one into a single word layer.
+
+    A run of letters is the only common thing that shares colour, height, top
+    and bottom while standing closer together than a fraction of its height.
+    """
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    boxes = [_bbox(mask) for mask in masks]
+    glyphs: list[int] = []
+    for i, (mask, (x0, y0, x1, y1)) in enumerate(zip(masks, boxes)):
+        if y1 - y0 >= GLYPH_MIN_HEIGHT and (x1 - x0) <= GLYPH_MAX_ASPECT * (y1 - y0):
+            glyphs.append(i)
+    colours = {i: np.median(lab[masks[i]], axis=0) for i in glyphs}
+
+    parent = list(range(len(masks)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def same_line(i: int, j: int, max_gap: float) -> bool:
+        ax0, ay0, ax1, ay1 = boxes[i]
+        bx0, by0, bx1, by1 = boxes[j]
+        line = max(ay1 - ay0, by1 - by0)
+        # Tops may differ more than baselines: accents make some glyphs taller.
+        return (
+            min(ay1 - ay0, by1 - by0) >= GLYPH_MIN_HEIGHT_RATIO * line
+            and abs(ay0 - by0) <= GLYPH_TOP_ALIGN * line
+            and abs(ay1 - by1) <= GLYPH_BASE_ALIGN * line
+            and max(ax0, bx0) - min(ax1, bx1) <= max_gap * line
+            and float(np.linalg.norm(colours[i] - colours[j])) <= GLYPH_COLOUR_DISTANCE
+        )
+
+    pairs = [(i, j) for position, i in enumerate(glyphs) for j in glyphs[position + 1 :]]
+    for i, j in pairs:
+        if same_line(i, j, GLYPH_MAX_GAP):
+            parent[find(j)] = find(i)
+    # Words of one line, but only once letters have been recognised on a side:
+    # two lone speech bubbles side by side must stay separate.
+    sizes = np.bincount([find(i) for i in range(len(masks))], minlength=len(masks))
+    for i, j in pairs:
+        if find(i) != find(j) and max(sizes[find(i)], sizes[find(j)]) >= 2 and same_line(i, j, WORD_MAX_GAP):
+            parent[find(j)] = find(i)
+
+    # Each group keeps the place of its first member: the list is the z-order.
+    groups: dict[int, np.ndarray] = {}
+    for i, mask in enumerate(masks):
+        root = find(i)
+        groups[root] = groups[root] | mask if root in groups else mask
+    return list(groups.values())
+
+
 def _clean_visible(mask: np.ndarray, min_pixels: int) -> np.ndarray:
     """Drop slivers left behind when upper layers cut this one apart."""
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
@@ -403,7 +621,7 @@ def decompose(
     rgb: np.ndarray,
     embeddings,
     detail: Detail = "medium",
-    max_layers: int = 24,
+    max_layers: int = 40,
     edge: float = 1.0,
     with_shadows: bool = False,
     progress: Progress = lambda stage, value: None,
@@ -417,15 +635,27 @@ def decompose(
         rgb, embeddings, progress=lambda v: progress("Đang tìm các phần tử", 0.02 + v * 0.28)
     )
     chosen = select_masks(logits, scores, point_ids, detail, max_layers)
+    selected = [_upsample(logits[index], width, height) for index in chosen]
+
+    page = _find_page(rgb, logits, scores)
+    if page is not None:
+        progress("Đang tìm phần còn sót", 0.3)
+        selected += _fill_gaps(rgb, embeddings, selected, page, max(32, int(pixels * GAP_MIN_AREA)))
+        selected.sort(key=lambda mask: -int(mask.sum()))
 
     # Every pixel belongs to exactly one layer: the top-most mask covering it.
     # Masks are ordered big to small, so small elements end up on top.
     owner = np.full((height, width), -1, np.int16)
-    for z, index in enumerate(chosen):
-        owner[_upsample(logits[index], width, height)] = z
+    for z, mask in enumerate(selected):
+        owner[mask] = z
     min_pixels = max(32, int(pixels * 0.0003))
-    visible = [_clean_visible(owner == z, min_pixels) for z in range(len(chosen))]
+    visible = [_clean_visible(owner == z, min_pixels) for z in range(len(selected))]
     visible = [mask for mask in visible if mask.sum() >= min_pixels]
+    if visible:
+        visible = _group_words(rgb, visible)
+        crumbs = None if page is None else _crumbs(page, visible)
+        if crumbs is not None:
+            visible.append(crumbs)
     if with_shadows and len(visible) > 1:
         from . import shadow
 
@@ -439,12 +669,13 @@ def decompose(
     hole = np.zeros((height, width), bool)
     for i, mask in enumerate(visible):
         progress("Đang làm mịn biên", 0.3 + 0.45 * i / len(visible))
-        alpha, box, radius = matte(rgb, mask, edge)
+        alpha, box, radius = matte(rgb, mask, edge * FLAT_EDGE_SCALE if page is not None else edge)
         alphas.append((alpha, box, radius))
         x0, y0, x1, y1 = box
         hole[y0:y1, x0:x1] |= alpha > ALPHA_MIN
     # Shadows come off first, or LaMa would extend them across the hole.
     source = rgb
+    darkening = None
     shadow_parts: dict[int, Layer] = {}
     if with_shadows:
         from . import shadow
@@ -469,7 +700,15 @@ def decompose(
                     shadow_parts[z] = layer
 
     progress("Đang vá nền", 0.77)
-    background = inpaint_region(source, _dilate(hole, _hole_radius(width, height, 0)))
+    clear_hole = _dilate(hole, _hole_radius(width, height, 0))
+    # On a plain page the true background is known: only guessing could spoil it.
+    if page is None:
+        background = inpaint_region(source, clear_hole)
+    else:
+        # Soft shadows fade below the page's colour tolerance, so keep well clear.
+        if darkening is not None and darkening.any():
+            clear_hole |= _dilate(darkening > 0, SHADOW_CLEARANCE)
+        background = _smooth_fill(source, page & ~clear_hole)
 
     # Union of everything above layer z, so lower layers can extend under it.
     above = np.zeros((height, width), bool)
@@ -494,7 +733,7 @@ def decompose(
         rgba = decontaminate(crop_rgb, under[y0:y1, x0:x1], alpha)
 
         if crop_upper.any():
-            rgba = _extend_under(rgba, crop_rgb, crop_mask, crop_upper, radius)
+            rgba = _extend_under(rgba, crop_rgb, crop_mask, crop_upper, radius, flat=page is not None)
 
         layer = _trim(rgba, x0, y0, f"Phần tử {i + 1}")
         layers.append(layer)
@@ -503,8 +742,23 @@ def decompose(
     return layers, background
 
 
+def _flat_paint(rgb: np.ndarray, mask: np.ndarray, area: np.ndarray) -> np.ndarray:
+    """One solid colour per hidden area: what surrounds it, not a blur of it."""
+    painted = rgb.copy()
+    count, labels = cv2.connectedComponents(area.astype(np.uint8), connectivity=8)
+    for label in range(1, count):
+        part = labels == label
+        box = _bbox(part)
+        reach = max(3, int(max(box[2] - box[0], box[3] - box[1]) * 0.1))
+        x0, y0, x1, y1 = _pad_box(box, reach + 1, mask.shape[1], mask.shape[0])
+        ring = _dilate(part[y0:y1, x0:x1], reach) & mask[y0:y1, x0:x1]
+        if ring.any():
+            painted[part] = np.median(rgb[y0:y1, x0:x1][ring], axis=0)
+    return painted
+
+
 def _extend_under(
-    rgba: np.ndarray, rgb: np.ndarray, mask: np.ndarray, upper: np.ndarray, radius: int
+    rgba: np.ndarray, rgb: np.ndarray, mask: np.ndarray, upper: np.ndarray, radius: int, flat: bool = False
 ) -> np.ndarray:
     """Make a layer whole where the layers above hide it.
 
@@ -518,7 +772,7 @@ def _extend_under(
 
     if interior.any():
         # Filled from this layer's own pixels only, never from what lies on top.
-        painted = _smooth_fill(rgb, mask)
+        painted = _flat_paint(rgb, mask, interior) if flat else _smooth_fill(rgb, mask)
         rgba[..., :3][interior] = painted[interior]
         rgba[..., 3][interior] = 255
 

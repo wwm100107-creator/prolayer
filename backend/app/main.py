@@ -288,7 +288,7 @@ def extract(session_id: str, request: ExtractRequest) -> dict:
 
 class DecomposeRequest(BaseModel):
     detail: pipeline.Detail = "medium"
-    max_layers: int = Field(24, ge=1, le=60)
+    max_layers: int = Field(40, ge=1, le=60)
     edge: float = Field(1.0, ge=0.2, le=4.0)
     text: bool = True
     shadow: bool = True

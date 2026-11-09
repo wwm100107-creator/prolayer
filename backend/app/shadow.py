@@ -23,7 +23,16 @@ MAX_ALPHA = 0.85
 MAX_OUTER_CONTACT = 0.3
 ALPHA_EPS = 0.02
 SOFT_EDGE_RATIO = 0.2
+HARD_EDGE_PERCENTILE = 80
+MIN_SAME_HUE = 0.9
 MAX_SURFACE_DETAIL = 6.0
+
+
+def _gradient(lightness: np.ndarray) -> np.ndarray:
+    """Brightness change per pixel."""
+    grad_x = cv2.Sobel(lightness, cv2.CV_32F, 1, 0, ksize=3) / 8
+    grad_y = cv2.Sobel(lightness, cv2.CV_32F, 0, 1, ksize=3) / 8
+    return np.hypot(grad_x, grad_y)
 
 
 def _masked_blur(image: np.ndarray, valid: np.ndarray, sigma: float) -> np.ndarray:
@@ -73,12 +82,21 @@ def estimate(rgb: np.ndarray, objects: np.ndarray) -> np.ndarray:
     count, labels, stats, _ = cv2.connectedComponentsWithStats(candidate.astype(np.uint8), connectivity=8)
     keep = np.zeros(count, bool)
     min_area = max(30, int(body.sum() * 0.01))
+    gradient = _gradient(lab[..., 0].astype(np.float32))
+    band = 3 + int(sigma)
+    clear_of_objects = ~_dilate(body, 3)
     for label in range(1, count):
         if stats[label, cv2.CC_STAT_AREA] < min_area:
             continue
         part = labels == label
-        if (part & contact).any() and darkness[part].mean() >= MIN_MEAN_DARKNESS:
-            keep[label] = (part & outer).sum() / outer_total <= MAX_OUTER_CONTACT
+        if not (part & contact).any() or darkness[part].mean() < MIN_MEAN_DARKNESS:
+            continue
+        if (part & outer).sum() / outer_total > MAX_OUTER_CONTACT:
+            continue
+        # A drawn shape next to the object has a crisp outline; a cast shadow fades.
+        rim = _dilate(part, band) & _dilate(~part, band) & clear_of_objects
+        step = float(np.percentile((lit[..., 0] - observed[..., 0])[part], 75))
+        keep[label] = not rim.any() or float(np.percentile(gradient[rim], HARD_EDGE_PERCENTILE)) < step * SOFT_EDGE_RATIO
     if not keep.any():
         return none
 
@@ -100,9 +118,7 @@ def without_shadow_masks(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.nd
     scale = min(1.0, WORK_SIDE / max(height, width))
     size = (max(1, round(width * scale)), max(1, round(height * scale)))
     lab = cv2.cvtColor(cv2.resize(rgb, size, interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2LAB).astype(np.float32)
-    grad_x = cv2.Sobel(lab[..., 0], cv2.CV_32F, 1, 0, ksize=3) / 8
-    grad_y = cv2.Sobel(lab[..., 0], cv2.CV_32F, 0, 1, ksize=3) / 8
-    gradient = np.hypot(grad_x, grad_y)
+    gradient = _gradient(lab[..., 0])
     small = [cv2.resize(m.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0 for m in masks]
     union_count = np.sum(small, axis=0)
 
@@ -114,14 +130,16 @@ def without_shadow_masks(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.nd
         if area and (_dilate(small_mask, 3) & others).any():
             reach = max(4, int(math.sqrt(area) * 0.15))
             ring = _dilate(small_mask, reach) & ~_dilate(small_mask, 2) & ~_dilate(others, 2)
-            outline = _dilate(small_mask, 2) & ~small_mask & ~_dilate(others, 3)
+            # Both sides of the outline: SAM's edge can sit a few pixels off the real one.
+            outline = _dilate(small_mask, 3) & _dilate(~small_mask, 3) & ~_dilate(others, 4)
             if ring.sum() >= 20 and outline.sum() >= 10:
                 inside, around = lab[small_mask].mean(axis=0), lab[ring].mean(axis=0)
                 drop = float(around[0] - inside[0])
-                hue_shift = float(np.hypot(*(inside[1:] - around[1:])))
-                if drop >= around[0] * MIN_MEAN_DARKNESS and hue_shift <= MAX_CHROMA_SHIFT:
+                # Per pixel: a mean hides a figure whose colours happen to average grey.
+                same_hue = np.hypot(*np.moveaxis(lab[small_mask][:, 1:] - around[1:], 1, 0)) <= MAX_CHROMA_SHIFT
+                if drop >= around[0] * MIN_MEAN_DARKNESS and float(same_hue.mean()) >= MIN_SAME_HUE:
                     # Hard edges cross the whole brightness step in about two pixels.
-                    keep = float(gradient[outline].mean()) >= drop * SOFT_EDGE_RATIO
+                    keep = float(np.percentile(gradient[outline], HARD_EDGE_PERCENTILE)) >= drop * SOFT_EDGE_RATIO
         if keep:
             kept.append(mask)
     return kept
