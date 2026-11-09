@@ -1,0 +1,12 @@
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.9
+transformers>=4.56
+accelerate>=1.0
+safetensors>=0.4
+huggingface_hub>=0.34
+opencv-python-headless>=4.10
+pillow>=10.4
+numpy>=1.26
+easyocr>=1.7.2
+vtracer>=0.6

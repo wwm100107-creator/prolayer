@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ProLayer</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='3' width='18' height='18' fill='%230a86b8'/%3E%3Crect x='11' y='11' width='18' height='18' fill='%23c9126b' fill-opacity='.85'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand" aria-label="ProLayer"><span class="brand-mark" aria-hidden="true"></span>ProLayer</div>
+      <p id="status" class="status" role="status"></p>
+      <div class="topbar-actions">
+        <button id="compare" class="ghost" disabled title="Giữ để xem ảnh gốc">Xem ảnh gốc</button>
+        <button id="open" class="ghost">Mở ảnh khác</button>
+        <span class="export-label">Xuất</span>
+        <button id="export-png" class="ghost" disabled title="Một ảnh PNG đã gộp">PNG</button>
+        <button id="export-zip" class="ghost" disabled title="Mỗi layer một file PNG, gói trong ZIP">ZIP</button>
+        <button id="export-svg" class="ghost" disabled title="Hình phẳng thành vector, chữ giữ nguyên là chữ, ảnh chụp giữ dạng ảnh">SVG</button>
+        <button id="export-psd" class="primary" disabled title="File Photoshop giữ layer, chữ và chế độ hòa trộn">PSD</button>
+      </div>
+      <div id="progress" class="progress" hidden><span></span></div>
+    </header>
+
+    <main class="workspace">
+      <nav class="rail" aria-label="Công cụ">
+        <button class="tool" data-tool="move" title="Di chuyển layer (V)" aria-label="Di chuyển layer">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3l14 8-6.2 1.7L9.6 19z" /></svg>
+        </button>
+        <button class="tool" data-tool="point" title="Bấm để chọn phần tử (C)" aria-label="Bấm để chọn phần tử">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2" /><path class="line" d="M12 2v5M12 17v5M2 12h5M17 12h5" /></svg>
+        </button>
+        <button class="tool" data-tool="box" title="Vẽ khung quanh phần tử (B)" aria-label="Vẽ khung quanh phần tử">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path class="line" d="M4 8V4h4M16 4h4v4M20 16v4h-4M8 20H4v-4" /></svg>
+        </button>
+      </nav>
+
+      <section id="pasteboard" class="pasteboard">
+        <canvas id="stage"></canvas>
+        <div id="stack" class="stack" aria-hidden="true" hidden></div>
+
+        <div id="dropzone" class="dropzone">
+          <h1>Thả ảnh vào đây để tách thành từng layer</h1>
+          <p>PNG, JPEG, WEBP hoặc BMP, tối đa 40MB</p>
+          <button id="pick" class="primary">Chọn ảnh</button>
+        </div>
+
+        <form id="selection" class="selection" hidden>
+          <p id="selection-hint">Bấm vào phần cần tách. Bấm chuột phải để loại bớt vùng.</p>
+          <fieldset id="level" class="segmented" aria-label="Phạm vi vùng chọn" hidden>
+            <label><input type="radio" name="level" value="auto" checked /><span>Tự động</span></label>
+            <label><input type="radio" name="level" value="0" /><span>Một phần</span></label>
+            <label><input type="radio" name="level" value="1" /><span>Vừa</span></label>
+            <label><input type="radio" name="level" value="2" /><span>Cả vật thể</span></label>
+          </fieldset>
+          <label class="slider" title="Tăng lên cho tóc, lông, viền mềm">Độ mềm biên
+            <input id="edge" type="range" min="0.3" max="3" step="0.1" value="1" />
+          </label>
+          <label class="check" title="Dành cho kính, nước, voan, khói"><input id="transparent" type="checkbox" /> Trong suốt</label>
+          <label class="check" title="Tách luôn bóng của vật thành một layer riêng"><input id="with-shadow" type="checkbox" /> Kèm bóng đổ</label>
+          <button type="button" id="clear-selection" class="ghost">Bỏ chọn</button>
+          <button type="submit" id="extract" class="primary" disabled>Tách thành layer</button>
+        </form>
+      </section>
+
+      <aside class="panel" aria-label="Layer">
+        <div class="auto">
+          <fieldset id="detail" class="segmented" aria-label="Số lượng layer">
+            <label><input type="radio" name="detail" value="coarse" /><span>Ít lớp</span></label>
+            <label><input type="radio" name="detail" value="medium" checked /><span>Vừa</span></label>
+            <label><input type="radio" name="detail" value="fine" /><span>Nhiều lớp</span></label>
+          </fieldset>
+          <div class="options">
+            <label class="check"><input id="auto-text" type="checkbox" checked /> Tách chữ</label>
+            <label class="check"><input id="auto-shadow" type="checkbox" checked /> Tách bóng đổ</label>
+          </div>
+          <button id="auto" class="primary wide" disabled>Tự tách cả ảnh</button>
+        </div>
+        <h2>Layer</h2>
+        <ol id="layers" class="layers"></ol>
+        <p id="layers-empty" class="layers-empty">Chưa có layer nào. Tự tách cả ảnh, hoặc dùng công cụ bên trái để lấy từng phần tử.</p>
+        <div id="layer-props" class="props" hidden>
+          <label class="slider">Độ mờ
+            <input id="opacity" type="range" min="0" max="100" value="100" />
+          </label>
+          <label class="select">Chế độ hòa trộn
+            <select id="blend">
+              <option value="normal">Bình thường</option>
+              <option value="multiply">Nhân (bóng đổ)</option>
+              <option value="screen">Sáng</option>
+              <option value="overlay">Phủ</option>
+            </select>
+          </label>
+          <button id="stack-view" class="ghost wide">Xem các lớp xếp chồng</button>
+        </div>
+      </aside>
+    </main>
+    <dialog id="key-dialog" class="key-dialog">
+      <form method="dialog">
+        <h2>Nhập mã truy cập</h2>
+        <p>Máy chủ AI này yêu cầu mã truy cập. Mã được lưu trên trình duyệt này.</p>
+        <label for="key-input">Mã truy cập</label>
+        <input id="key-input" type="password" autocomplete="off" required />
+        <button class="primary wide" value="save">Lưu mã</button>
+      </form>
+    </dialog>
+    <input id="file" type="file" accept="image/png,image/jpeg,image/webp,image/bmp" hidden />
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
