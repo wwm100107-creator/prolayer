@@ -48,6 +48,22 @@ GAP_MIN_SCORE = 0.5
 GAP_MIN_NEW = 0.6
 GAP_MAX_PAGE = 0.1
 
+# Whole objects from parts, on flat artwork.
+SNAP_SHARE = 0.5
+SNAP_RIM = 2
+NESTED_SHARE = 0.9
+CONTAINER_SHARE = 0.45
+BLOCK_SHARE = 0.3
+BLOCK_FILL = 0.75
+PART_MAX_SIZE = 0.5
+PART_MAX_ASPECT = 3.0
+PART_MIN_BORDER = 0.1
+PALE_PART_MIN_BORDER = 0.3
+PALE_DISTANCE = 40.0
+# How far a shape is assumed to continue under what covers it, relative to its size.
+CLOSING_REACH = 0.15
+FRINGE = 2
+
 # What a run of letters looks like, relative to its line height.
 GLYPH_MIN_HEIGHT = 12
 GLYPH_MAX_ASPECT = 2.5
@@ -55,7 +71,11 @@ GLYPH_MIN_HEIGHT_RATIO = 0.6
 GLYPH_TOP_ALIGN = 0.45
 GLYPH_BASE_ALIGN = 0.15
 GLYPH_MAX_GAP = 0.35
-WORD_MAX_GAP = 0.8
+WORD_MAX_GAP = 1.2
+# Looser than for letters: a glyph with a drop shadow has a different median.
+WORD_COLOUR_DISTANCE = 60.0
+STRAY_REACH = 6
+LINE_MARGIN = 0.12
 GLYPH_COLOUR_DISTANCE = 12.0
 
 
@@ -433,7 +453,12 @@ def _find_page(rgb: np.ndarray, logits: np.ndarray, scores: np.ndarray) -> np.nd
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     surface = cv2.cvtColor(_smooth_fill(rgb, core), cv2.COLOR_RGB2LAB)
     difference = np.linalg.norm(lab.astype(np.float32) - surface.astype(np.float32), axis=2)
-    return difference <= PAGE_COLOUR_DISTANCE
+    # Must reach the image border: an eye or a shirt can share the page's colour.
+    count, labels = cv2.connectedComponents((difference <= PAGE_COLOUR_DISTANCE).astype(np.uint8), connectivity=4)
+    border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    keep = np.zeros(count, bool)
+    keep[border[border > 0]] = True
+    return keep[labels]
 
 
 def _flat_shapes(rgb: np.ndarray, region: np.ndarray, min_pixels: int) -> list[np.ndarray]:
@@ -529,6 +554,121 @@ def _crumbs(page: np.ndarray, visible: list[np.ndarray]) -> np.ndarray | None:
     return keep[labels] if keep.any() else None
 
 
+def _flat_regions(rgb: np.ndarray, page: np.ndarray) -> np.ndarray:
+    """Connected areas of even colour; 0 marks edges and anything page-like.
+
+    White on a pale page has so faint an edge that the two flood together, and
+    the inside of an outlined icon is just the page again. Neither can tell
+    where an element ends, so those pixels are left to SAM's outline.
+    """
+    flat = (_colour_edges(rgb) < SHAPE_EDGE).astype(np.uint8)
+    count, labels = cv2.connectedComponents(flat, connectivity=4)
+    sizes = np.maximum(np.bincount(labels.ravel(), minlength=count), 1)
+    on_page = np.bincount(labels[page], minlength=count) / sizes
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    mean = np.stack([np.bincount(labels.ravel(), lab[..., c].ravel(), minlength=count) / sizes for c in range(3)], axis=1)
+    surface = np.median(lab[page], axis=0)
+    page_like = (on_page >= 0.5) | (np.linalg.norm(mean - surface, axis=1) <= PAGE_COLOUR_DISTANCE)
+    page_like[0] = True
+    labels[page_like[labels]] = 0
+    return labels
+
+
+def _snap(mask: np.ndarray, regions: np.ndarray, sizes: np.ndarray, page: np.ndarray) -> np.ndarray:
+    """Moves SAM's soft 256px outline onto the crisp colour edges of drawn art."""
+    inside = np.bincount(regions[mask], minlength=len(sizes))
+    keep = inside >= SNAP_SHARE * sizes
+    keep[0] = False
+    solid = keep[regions]
+    edges = regions == 0
+    snapped = (solid | (edges & (mask | _dilate(solid, SNAP_RIM)))) & ~page
+    return snapped if snapped.any() else mask
+
+
+def _is_container(mask: np.ndarray, regions: np.ndarray) -> bool:
+    """True for a surface that things sit on: mostly one area of even colour."""
+    values = regions[mask]
+    values = values[values > 0]
+    if not len(values):
+        return False
+    counts = np.bincount(values)
+    largest, share = int(counts.argmax()), float(counts.max()) / float(mask.sum())
+    if share >= CONTAINER_SHARE:
+        return True
+    if share < BLOCK_SHARE:
+        return False
+    # A panel stays a solid block even when its contents punch holes in it;
+    # the biggest area of a figure, such as its hair, is an irregular patch.
+    region = regions == largest
+    x0, y0, x1, y1 = _bbox(region)
+    return float(_fill_interior(region[y0:y1, x0:x1]).mean()) >= BLOCK_FILL
+
+
+def _is_surface(mask: np.ndarray, regions: np.ndarray, found_in_gaps: np.ndarray) -> bool:
+    """Something objects stand on. What the object grid missed is never a figure."""
+    return bool((mask & found_in_gaps).sum() >= 0.5 * mask.sum()) or _is_container(mask, regions)
+
+
+def _absorb_nested(masks: list[np.ndarray], regions: np.ndarray, found_in_gaps: np.ndarray) -> list[np.ndarray]:
+    """Parts inside an object stay with it; only surfaces keep separate children.
+
+    A skirt belongs to the figure wearing it, but a chart stands on its board.
+    """
+    kept: list[np.ndarray] = []
+    filled: list[np.ndarray] = []
+    surface: list[bool] = []
+    for mask in sorted(masks, key=lambda m: -int(m.sum())):
+        area = max(int(mask.sum()), 1)
+        parent = next(
+            (i for i in range(len(kept) - 1, -1, -1) if (filled[i] & mask).sum() >= NESTED_SHARE * area), None
+        )
+        if parent is not None and not surface[parent]:
+            kept[parent] = kept[parent] | mask
+            continue
+        kept.append(mask)
+        filled.append(_fill_interior(mask))
+        surface.append(_is_surface(mask, regions, found_in_gaps))
+    return kept
+
+
+def _merge_parts(
+    rgb: np.ndarray, masks: list[np.ndarray], regions: np.ndarray, page: np.ndarray, found_in_gaps: np.ndarray
+) -> list[np.ndarray]:
+    """Joins a piece to the object it clearly belongs to: legs, a held clipboard.
+
+    Pale pieces need a far longer shared border, or the ellipse under a figure's
+    feet and a speech bubble touching its head would be swallowed too.
+    """
+    masks = list(masks)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    surface_lab = np.median(lab[page], axis=0) if page.any() else lab.mean((0, 1))
+    alive = [True] * len(masks)
+    surfaces = [_is_surface(mask, regions, found_in_gaps) for mask in masks]
+    for index in sorted(range(len(masks)), key=lambda i: int(masks[i].sum())):
+        mask = masks[index]
+        area = int(mask.sum())
+        x0, y0, x1, y1 = _bbox(mask)
+        # Long strips are lines of text, bars and rules, not limbs.
+        if max(x1 - x0, y1 - y0) > PART_MAX_ASPECT * min(x1 - x0, y1 - y0):
+            continue
+        rim = _dilate(mask, 2) & ~mask
+        perimeter = max(int(rim.sum()), 1)
+        best, shared = -1, 0
+        for other in range(len(masks)):
+            if other == index or not alive[other] or surfaces[other] or area > PART_MAX_SIZE * int(masks[other].sum()):
+                continue
+            count = int((rim & masks[other]).sum())
+            if count > shared:
+                best, shared = other, count
+        if best < 0:
+            continue
+        pale = float(np.linalg.norm(np.median(lab[mask], axis=0) - surface_lab)) < PALE_DISTANCE
+        if shared / perimeter >= (PALE_PART_MIN_BORDER if pale else PART_MIN_BORDER):
+            masks[best] = masks[best] | mask
+            alive[index] = False
+    return [mask for mask, live in zip(masks, alive) if live]
+
+
 def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.ndarray]:
     """Joins glyphs that SAM outlined one by one into a single word layer.
 
@@ -551,7 +691,7 @@ def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.ndarray]:
             i = parent[i]
         return i
 
-    def same_line(i: int, j: int, max_gap: float) -> bool:
+    def same_line(i: int, j: int, max_gap: float, max_colour: float = GLYPH_COLOUR_DISTANCE) -> bool:
         ax0, ay0, ax1, ay1 = boxes[i]
         bx0, by0, bx1, by1 = boxes[j]
         line = max(ay1 - ay0, by1 - by0)
@@ -561,7 +701,7 @@ def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.ndarray]:
             and abs(ay0 - by0) <= GLYPH_TOP_ALIGN * line
             and abs(ay1 - by1) <= GLYPH_BASE_ALIGN * line
             and max(ax0, bx0) - min(ax1, bx1) <= max_gap * line
-            and float(np.linalg.norm(colours[i] - colours[j])) <= GLYPH_COLOUR_DISTANCE
+            and float(np.linalg.norm(colours[i] - colours[j])) <= max_colour
         )
 
     pairs = [(i, j) for position, i in enumerate(glyphs) for j in glyphs[position + 1 :]]
@@ -570,17 +710,57 @@ def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.ndarray]:
             parent[find(j)] = find(i)
     # Words of one line, but only once letters have been recognised on a side:
     # two lone speech bubbles side by side must stay separate.
-    sizes = np.bincount([find(i) for i in range(len(masks))], minlength=len(masks))
-    for i, j in pairs:
-        if find(i) != find(j) and max(sizes[find(i)], sizes[find(j)]) >= 2 and same_line(i, j, WORD_MAX_GAP):
-            parent[find(j)] = find(i)
+    joined = True
+    while joined:
+        joined = False
+        sizes = np.bincount([find(i) for i in range(len(masks))], minlength=len(masks))
+        for i, j in pairs:
+            if (
+                find(i) != find(j)
+                and max(sizes[find(i)], sizes[find(j)]) >= 2
+                and same_line(i, j, WORD_MAX_GAP, WORD_COLOUR_DISTANCE)
+            ):
+                parent[find(j)] = find(i)
+                joined = True
+                break
 
     # Each group keeps the place of its first member: the list is the z-order.
     groups: dict[int, np.ndarray] = {}
+    members: dict[int, int] = {}
     for i, mask in enumerate(masks):
         root = find(i)
         groups[root] = groups[root] | mask if root in groups else mask
+        members[root] = members.get(root, 0) + 1
+    words = [root for root, count in members.items() if count >= 2]
+    for root in words:
+        lines = np.array([boxes[i] for i in range(len(masks)) if find(i) == root])
+        groups[root] = _trim_to_line(groups, root, lines)
     return list(groups.values())
+
+
+def _trim_to_line(groups: dict[int, np.ndarray], root: int, lines: np.ndarray) -> np.ndarray:
+    """Hands pieces of the next text line back: SAM's glyph masks can overlap it."""
+    word = groups[root]
+    # Low percentile: several glyphs may have flooded into the line below.
+    top, bottom = float(np.median(lines[:, 1])), float(np.percentile(lines[:, 3], 25))
+    height = bottom - top
+    below = word.copy()
+    below[: min(word.shape[0], int(bottom + height * LINE_MARGIN))] = False
+    if not below.any():
+        return word
+    # Find the other line this piece belongs to, by where it sits.
+    count, labels = cv2.connectedComponents(below.astype(np.uint8), connectivity=8)
+    for label in range(1, count):
+        part = labels == label
+        px0, py0, px1, py1 = _bbox(part)
+        for other, mask in groups.items():
+            if other == root:
+                continue
+            x0, y0, x1, y1 = _bbox(mask)
+            if px0 < x1 + STRAY_REACH and x0 - STRAY_REACH < px1 and py0 < y1 + STRAY_REACH and y0 - STRAY_REACH < py1:
+                groups[other] = mask | part
+                break
+    return word & ~below
 
 
 def _clean_visible(mask: np.ndarray, min_pixels: int) -> np.ndarray:
@@ -640,7 +820,14 @@ def decompose(
     page = _find_page(rgb, logits, scores)
     if page is not None:
         progress("Đang tìm phần còn sót", 0.3)
-        selected += _fill_gaps(rgb, embeddings, selected, page, max(32, int(pixels * GAP_MIN_AREA)))
+        gaps = _fill_gaps(rgb, embeddings, selected, page, max(32, int(pixels * GAP_MIN_AREA)))
+        selected += gaps
+        found_in_gaps = np.logical_or.reduce(gaps) if gaps else np.zeros((height, width), bool)
+        regions = _flat_regions(rgb, page)
+        sizes = np.bincount(regions.ravel())
+        selected = [_snap(mask, regions, sizes, page) for mask in selected]
+        if detail != "fine":
+            selected = _absorb_nested(selected, regions, found_in_gaps)
         selected.sort(key=lambda mask: -int(mask.sum()))
 
     # Every pixel belongs to exactly one layer: the top-most mask covering it.
@@ -653,6 +840,13 @@ def decompose(
     visible = [mask for mask in visible if mask.sum() >= min_pixels]
     if visible:
         visible = _group_words(rgb, visible)
+        if page is not None and detail != "fine":
+            visible = _merge_parts(rgb, visible, regions, page, found_in_gaps)
+            # Too small to be worth a row in the layer list: crumbs picks them up.
+            visible = [mask for mask in visible if mask.sum() >= pixels * GAP_MIN_AREA]
+        if page is not None:
+            # Figures stand in front of the panels and ellipses around them.
+            visible.sort(key=lambda mask: not _is_surface(mask, regions, found_in_gaps))
         crumbs = None if page is None else _crumbs(page, visible)
         if crumbs is not None:
             visible.append(crumbs)
@@ -733,7 +927,11 @@ def decompose(
         rgba = decontaminate(crop_rgb, under[y0:y1, x0:x1], alpha)
 
         if crop_upper.any():
-            rgba = _extend_under(rgba, crop_rgb, crop_mask, crop_upper, radius, flat=page is not None)
+            rgba = _extend_under(
+                rgba, crop_rgb, crop_mask, crop_upper, radius,
+                flat=page is not None,
+                surface=page is not None and _is_surface(mask, regions, found_in_gaps),
+            )
 
         layer = _trim(rgba, x0, y0, f"Phần tử {i + 1}")
         layers.append(layer)
@@ -758,7 +956,13 @@ def _flat_paint(rgb: np.ndarray, mask: np.ndarray, area: np.ndarray) -> np.ndarr
 
 
 def _extend_under(
-    rgba: np.ndarray, rgb: np.ndarray, mask: np.ndarray, upper: np.ndarray, radius: int, flat: bool = False
+    rgba: np.ndarray,
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    upper: np.ndarray,
+    radius: int,
+    flat: bool = False,
+    surface: bool = False,
 ) -> np.ndarray:
     """Make a layer whole where the layers above hide it.
 
@@ -769,10 +973,23 @@ def _extend_under(
     grow = max(2, radius)
     seam = _dilate(mask, grow) & _dilate(upper, grow)
     interior = (_fill_interior(mask | seam) | _occluded_hull(mask, upper)) & upper & ~mask
+    pure = mask
+    if surface:
+        box = _bbox(mask)
+        reach = max(4, int(max(box[2] - box[0], box[3] - box[1]) * CLOSING_REACH))
+        # Closing bridges what covers the shape without growing it anywhere else.
+        closed = ~_dilate(~_dilate(mask, reach), reach)
+        # Everything enclosed, including the hairline left between two outlines.
+        interior = (interior | (closed & upper) | _fill_interior(mask | (closed & upper))) & ~mask
+        # Colour from the object on top bleeds a little past its outline.
+        near_upper = _dilate(upper, FRINGE)
+        if (mask & ~near_upper).any():
+            pure = mask & ~near_upper
+            interior |= mask & near_upper
 
     if interior.any():
         # Filled from this layer's own pixels only, never from what lies on top.
-        painted = _flat_paint(rgb, mask, interior) if flat else _smooth_fill(rgb, mask)
+        painted = _flat_paint(rgb, pure, interior) if flat else _smooth_fill(rgb, mask)
         rgba[..., :3][interior] = painted[interior]
         rgba[..., 3][interior] = 255
 
