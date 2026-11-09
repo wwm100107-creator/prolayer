@@ -38,6 +38,8 @@ export interface TextInfo {
   postScriptName: string;
   fontWeight: number;
   fontSize: number;
+  /** Horizontal stretch that makes the matched font fill the original width. */
+  scaleX: number;
   color: [number, number, number];
   angle: number;
   /** Start of the baseline, in image pixels. */

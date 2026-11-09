@@ -110,6 +110,9 @@ window.addEventListener("drop", (event) => {
   }
 });
 
+const textField = $<HTMLLabelElement>("text-field");
+const textInput = $<HTMLTextAreaElement>("text-content");
+
 function confirmReplace(question: string): boolean {
   return editor.layers.length === 0 || window.confirm(question);
 }
@@ -365,6 +368,8 @@ function renderSelection(): void {
     item.setAttribute("aria-current", String(!!selected && item.dataset.id === selected.id));
   });
   opacityInput.disabled = blendInput.disabled = !selected;
+  textField.hidden = !selected?.text;
+  if (selected?.text && document.activeElement !== textInput) textInput.value = editor.textOf(selected);
   if (selected) {
     opacityInput.value = String(Math.round(selected.object.opacity * 100));
     blendInput.value = selected.blendMode;
@@ -373,6 +378,14 @@ function renderSelection(): void {
 
 editor.onLayersChanged = renderLayers;
 editor.onSelectionChanged = renderSelection;
+editor.onEditText = () => {
+  textInput.focus();
+  textInput.select();
+};
+
+textInput.addEventListener("input", () => {
+  if (editor.selected?.text) editor.setText(editor.selected, textInput.value);
+});
 
 opacityInput.addEventListener("input", () => {
   if (editor.selected) editor.setOpacity(editor.selected, Number(opacityInput.value) / 100);

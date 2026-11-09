@@ -58,7 +58,9 @@ tailscale funnel reset
 - Thứ tự layer tính theo diện tích: phần tử nhỏ nằm trên phần tử lớn.
 - Ảnh minh họa hoặc thiết kế trên nền phẳng cho kết quả tốt nhất: mọi phần khác màu nền đều thành layer, nền được dựng lại sạch. Nhân vật có thể bị chia thành vài layer khi bị vật khác che ngang.
 - Ảnh chụp không có nền phẳng vẫn yếu khi tách cả ảnh: người bị chia theo bộ phận và nền vá bị sai vì gần như toàn bộ ảnh bị khoét. Với ảnh chụp, nên chọn từng vật bằng công cụ bên trái.
-- Chữ có font trang trí hoặc OCR đọc sai sẽ được giữ thành layer ảnh, không thành chữ sửa được.
+- Layer chữ luôn hiển thị đúng pixel gốc. Chỉ khi sửa nội dung trong ô "Nội dung chữ" mới đổi sang font gần giống nhất, được kéo giãn cho vừa khổ chữ cũ.
+- OCR có thể thiếu dấu tiếng Việt, nhất là với font trang trí viết hoa; sửa trong ô nội dung.
+- Phần bị che được làm đầy bằng hình dạng và màu của chính vật đó; với ảnh chụp là LaMa học từ chính vật. Không sinh mới được chi tiết hoàn toàn bị khuất, như bàn tay hay khuôn mặt.
 - Vá nền với lỗ rất lớn trên ảnh chụp có thể bị nhòe hoặc tối (giới hạn của LaMa).
 - Vật bị che chỉ được hoàn thiện khi gần lồi hoặc phần khuất nằm trọn bên trong.
 - Bóng đổ dùng mô hình vật lý, không phải mạng đã huấn luyện: tốt trên nền phẳng hoặc ít họa tiết, và tự bỏ qua trên nền nhiều vân như gỗ.

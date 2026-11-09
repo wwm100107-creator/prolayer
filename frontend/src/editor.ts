@@ -8,8 +8,12 @@ export interface EditorLayer {
   name: string;
   object: FabricImage | IText;
   kind: LayerInfo["kind"];
-  /** The recognised font and position; `object` holds any edits to the words. */
+  /** The recognised words, font and position. */
   text: TextInfo | null;
+  /** The original pixels of a text layer, shown for as long as its words are unchanged. */
+  raster: FabricImage | null;
+  /** Where the image sat when it was extracted, to carry moves over to live text. */
+  home: { left: number; top: number };
   visible: boolean;
   blendMode: GlobalCompositeOperation;
 }
@@ -55,6 +59,7 @@ export class Editor {
   onLayersChanged: () => void = () => {};
   onSelectionChanged: () => void = () => {};
   onPromptChanged: () => void = () => {};
+  onEditText: () => void = () => {};
 
   private paper: Rect | null = null;
   private original: FabricImage | null = null;
@@ -75,6 +80,9 @@ export class Editor {
     this.canvas.on("mouse:down", (event) => this.pointerDown(event));
     this.canvas.on("mouse:move", (event) => this.pointerMove(event));
     this.canvas.on("mouse:up", () => this.pointerUp());
+    this.canvas.on("mouse:dblclick", () => {
+      if (this.selected?.text) this.onEditText();
+    });
     this.canvas.on("mouse:wheel", (event) => this.wheel(event));
     this.canvas.on("after:render", () => this.drawCropMarks());
     this.canvas.on("selection:created", () => this.onSelectionChanged());
@@ -149,31 +157,25 @@ export class Editor {
 
   async addLayer(info: LayerInfo): Promise<EditorLayer> {
     const blendMode = info.blendMode as GlobalCompositeOperation;
-    const object = info.text
-      ? this.makeText(info.text)
-      : await FabricImage.fromURL(apiUrl(info.url), { crossOrigin: "anonymous" }, {
-          ...PLACED,
-          ...HANDLES,
-          left: info.left,
-          top: info.top,
-          globalCompositeOperation: blendMode,
-        });
-    (object as FabricObject).on("modified", () => this.onLayersChanged());
+    const object = await FabricImage.fromURL(apiUrl(info.url), { crossOrigin: "anonymous" }, {
+      ...PLACED,
+      ...HANDLES,
+      left: info.left,
+      top: info.top,
+      globalCompositeOperation: blendMode,
+    });
+    object.on("modified", () => this.onLayersChanged());
     const layer: EditorLayer = {
       id: info.id,
       name: info.name,
       object,
       kind: info.kind,
       text: info.text,
+      raster: info.text ? object : null,
+      home: { left: info.left, top: info.top },
       visible: true,
       blendMode,
     };
-    if (object instanceof IText) {
-      object.on("editing:exited", () => {
-        layer.name = object.text.trim() || layer.name;
-        this.onLayersChanged();
-      });
-    }
     this.layers.push(layer);
     this.canvas.add(object);
     this.restack();
@@ -181,23 +183,76 @@ export class Editor {
     return layer;
   }
 
-  private makeText(text: TextInfo): IText {
+  private makeText(text: TextInfo, content: string): IText {
     const radians = (text.angle * Math.PI) / 180;
     const rise = text.fontSize * TEXT_BASELINE;
-    return new IText(text.content, {
+    return new IText(content, {
       ...PLACED,
       ...HANDLES,
       left: text.x + Math.sin(radians) * rise,
       top: text.y - Math.cos(radians) * rise,
       angle: text.angle,
+      scaleX: text.scaleX,
       fontFamily: text.fontFamily,
       fontWeight: text.fontWeight,
       fontSize: text.fontSize,
       fill: `rgb(${text.color.join(",")})`,
       lineHeight: 1,
-      editingBorderColor: "#c9126b",
-      cursorColor: "#c9126b",
+      // Words are typed in the side panel: a real text field handles Vietnamese
+      // input methods reliably, Fabric's in-canvas editor does not.
+      editable: false,
     });
+  }
+
+  /** The words a text layer currently says. */
+  textOf(layer: EditorLayer): string {
+    return layer.object instanceof IText ? layer.object.text : (layer.text?.content ?? "");
+  }
+
+  /**
+   * Original pixels stay on screen until the words really change, because no
+   * matched font can look exactly like them. Typing the original back restores them.
+   */
+  setText(layer: EditorLayer, value: string): void {
+    if (!layer.text || !layer.raster) return;
+    const unchanged = value === layer.text.content;
+    layer.name = value.trim() || layer.text.content;
+    const current = layer.object;
+    if (current instanceof IText) {
+      if (unchanged) {
+        const base = this.makeText(layer.text, value);
+        layer.raster.set({ left: layer.home.left + current.left - base.left, top: layer.home.top + current.top - base.top });
+        this.swapObject(layer, layer.raster);
+      } else {
+        current.set("text", value);
+        this.canvas.requestRenderAll();
+        this.onLayersChanged();
+      }
+    } else if (!unchanged) {
+      const live = this.makeText(layer.text, value);
+      live.set({
+        left: live.left + current.left - layer.home.left,
+        top: live.top + current.top - layer.home.top,
+        opacity: current.opacity,
+        visible: current.visible,
+        globalCompositeOperation: layer.blendMode,
+      });
+      live.on("modified", () => this.onLayersChanged());
+      this.swapObject(layer, live);
+    }
+  }
+
+  private swapObject(layer: EditorLayer, next: FabricImage | IText): void {
+    const active = this.canvas.getActiveObject() === layer.object;
+    next.set({ opacity: layer.object.opacity, visible: layer.visible });
+    this.canvas.remove(layer.object);
+    layer.object = next;
+    this.canvas.add(next);
+    next.setCoords();
+    this.restack();
+    if (active) this.canvas.setActiveObject(next);
+    this.canvas.requestRenderAll();
+    this.onLayersChanged();
   }
 
   /** Keeps Fabric's paint order equal to `layers`, overlay and markers on top. */

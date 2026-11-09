@@ -62,6 +62,11 @@ PALE_PART_MIN_BORDER = 0.3
 PALE_DISTANCE = 40.0
 # How far a shape is assumed to continue under what covers it, relative to its size.
 CLOSING_REACH = 0.15
+FIGURE_REACH = 0.06
+LEARNED_FILL_MIN = 64
+FILL_MIN_PIXELS = 64
+FILL_MIN_SHARE = 0.01
+EVEN_AREA_STD = 8.0
 FRINGE = 2
 
 # What a run of letters looks like, relative to its line height.
@@ -89,6 +94,8 @@ class Layer:
     blend_mode: str = "normal"
     kind: Literal["raster", "shadow", "text"] = "raster"
     text: dict | None = None
+    # Letters joined into a word: the OCR gets a second, cleaner look at these.
+    is_word: bool = False
 
 
 def _ellipse(radius: int) -> np.ndarray:
@@ -669,7 +676,7 @@ def _merge_parts(
     return [mask for mask, live in zip(masks, alive) if live]
 
 
-def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.ndarray]:
+def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> tuple[list[np.ndarray], set[int]]:
     """Joins glyphs that SAM outlined one by one into a single word layer.
 
     A run of letters is the only common thing that shares colour, height, top
@@ -735,7 +742,7 @@ def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.ndarray]:
     for root in words:
         lines = np.array([boxes[i] for i in range(len(masks)) if find(i) == root])
         groups[root] = _trim_to_line(groups, root, lines)
-    return list(groups.values())
+    return list(groups.values()), {id(groups[root]) for root in words}
 
 
 def _trim_to_line(groups: dict[int, np.ndarray], root: int, lines: np.ndarray) -> np.ndarray:
@@ -838,8 +845,9 @@ def decompose(
     min_pixels = max(32, int(pixels * 0.0003))
     visible = [_clean_visible(owner == z, min_pixels) for z in range(len(selected))]
     visible = [mask for mask in visible if mask.sum() >= min_pixels]
+    word_ids: set[int] = set()
     if visible:
-        visible = _group_words(rgb, visible)
+        visible, word_ids = _group_words(rgb, visible)
         if page is not None and detail != "fine":
             visible = _merge_parts(rgb, visible, regions, page, found_in_gaps)
             # Too small to be worth a row in the layer list: crumbs picks them up.
@@ -926,7 +934,8 @@ def decompose(
         crop_mask = mask[y0:y1, x0:x1]
         rgba = decontaminate(crop_rgb, under[y0:y1, x0:x1], alpha)
 
-        if crop_upper.any():
+        # Letters have no hidden part worth guessing; a word stops where it ends.
+        if crop_upper.any() and id(mask) not in word_ids:
             rgba = _extend_under(
                 rgba, crop_rgb, crop_mask, crop_upper, radius,
                 flat=page is not None,
@@ -934,25 +943,51 @@ def decompose(
             )
 
         layer = _trim(rgba, x0, y0, f"Phần tử {i + 1}")
+        layer.is_word = id(mask) in word_ids
         layers.append(layer)
         _composite(under, layer)
 
     return layers, background
 
 
-def _flat_paint(rgb: np.ndarray, mask: np.ndarray, area: np.ndarray) -> np.ndarray:
-    """One solid colour per hidden area: what surrounds it, not a blur of it."""
+def _continue_colours(rgb: np.ndarray, source: np.ndarray, area: np.ndarray) -> np.ndarray:
+    """Carries each area of even colour straight on under what hides it.
+
+    Only clean pixels are sources: an anti-aliased edge pixel would otherwise
+    be drawn out into a streak across the hidden part.
+    """
+    clean = source & (_colour_edges(rgb) < SHAPE_EDGE)
+    # Specks left over from other objects would be drawn out into stains too.
+    count, parts, stats, _ = cv2.connectedComponentsWithStats(clean.astype(np.uint8), connectivity=4)
+    large = stats[:, cv2.CC_STAT_AREA] >= max(FILL_MIN_PIXELS, FILL_MIN_SHARE * float(source.sum()))
+    large[0] = False
+    clean = large[parts] if large.any() else clean
+    if not clean.any():
+        clean = source
+    _, labels = cv2.distanceTransformWithLabels((~clean).astype(np.uint8), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    # Compression ringing tints the pixels around every edge. Drawn outward, one
+    # tinted pixel becomes a whole ray, so an even area gives its typical colour.
+    colours = rgb.copy()
+    for label in np.flatnonzero(large):
+        part = parts == label
+        if float(rgb[part].std(axis=0).max()) <= EVEN_AREA_STD:
+            colours[part] = np.median(rgb[part], axis=0)
+    by_label = np.zeros((int(labels.max()) + 1, 3), np.uint8)
+    by_label[labels[clean]] = colours[clean]
     painted = rgb.copy()
-    count, labels = cv2.connectedComponents(area.astype(np.uint8), connectivity=8)
-    for label in range(1, count):
-        part = labels == label
-        box = _bbox(part)
-        reach = max(3, int(max(box[2] - box[0], box[3] - box[1]) * 0.1))
-        x0, y0, x1, y1 = _pad_box(box, reach + 1, mask.shape[1], mask.shape[0])
-        ring = _dilate(part[y0:y1, x0:x1], reach) & mask[y0:y1, x0:x1]
-        if ring.any():
-            painted[part] = np.median(rgb[y0:y1, x0:x1][ring], axis=0)
+    painted[area] = by_label[labels[area]]
+    # The cells of the nearest-colour map meet in hard steps; soften them only.
+    softened = cv2.GaussianBlur(painted, (0, 0), 0.7)
+    painted[area] = softened[area]
     return painted
+
+
+def _learned_fill(rgb: np.ndarray, source: np.ndarray, area: np.ndarray) -> np.ndarray:
+    """Texture for a photographed object, learned from that object alone."""
+    if int(area.sum()) < LEARNED_FILL_MIN or not source.any():
+        return _continue_colours(rgb, source, area)
+    # Everything that is not this object is unknown, so nothing else can leak in.
+    return engine.inpaint(rgb, ~source)
 
 
 def _extend_under(
@@ -972,15 +1007,19 @@ def _extend_under(
     rgba = rgba.copy()
     grow = max(2, radius)
     seam = _dilate(mask, grow) & _dilate(upper, grow)
-    interior = (_fill_interior(mask | seam) | _occluded_hull(mask, upper)) & upper & ~mask
+    hull = _occluded_hull(mask, upper)
+    interior = (_fill_interior(mask | seam) | hull) & upper & ~mask
     pure = mask
-    if surface:
+    if flat:
         box = _bbox(mask)
-        reach = max(4, int(max(box[2] - box[0], box[3] - box[1]) * CLOSING_REACH))
-        # Closing bridges what covers the shape without growing it anywhere else.
-        closed = ~_dilate(~_dilate(mask, reach), reach)
+        reach = max(4, int(max(box[2] - box[0], box[3] - box[1]) * (CLOSING_REACH if surface else FIGURE_REACH)))
+        if not hull.any():
+            # Closing bridges what covers the shape without growing it elsewhere.
+            closed = ~_dilate(~_dilate(mask, reach), reach)
+            interior |= closed & upper & ~mask
+    if surface:
         # Everything enclosed, including the hairline left between two outlines.
-        interior = (interior | (closed & upper) | _fill_interior(mask | (closed & upper))) & ~mask
+        interior = (interior | _fill_interior(mask | interior)) & ~mask
         # Colour from the object on top bleeds a little past its outline.
         near_upper = _dilate(upper, FRINGE)
         if (mask & ~near_upper).any():
@@ -989,7 +1028,7 @@ def _extend_under(
 
     if interior.any():
         # Filled from this layer's own pixels only, never from what lies on top.
-        painted = _flat_paint(rgb, pure, interior) if flat else _smooth_fill(rgb, mask)
+        painted = _continue_colours(rgb, pure, interior) if flat else _learned_fill(rgb, mask, interior)
         rgba[..., :3][interior] = painted[interior]
         rgba[..., 3][interior] = 255
 

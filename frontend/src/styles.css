@@ -161,6 +161,9 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .icon:hover { color: var(--ink); background: var(--plate); }
 
 .props { display: flex; flex-direction: column; gap: 10px; padding: 12px; border-top: 1px solid var(--plate-line); }
+.text-field { display: grid; gap: 6px; font-size: 14px; }
+.text-field textarea { width: 100%; resize: vertical; padding: 6px 8px; font: inherit; border: 1px solid #9aa3ad; border-radius: 3px; background: #fff; color: #16243a; }
+.text-field textarea:focus { outline: 2px solid var(--magenta); outline-offset: 0; }
 .props .slider { justify-content: space-between; }
 .props .slider input { width: 170px; }
 .select { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 14px; }

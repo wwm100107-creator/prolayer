@@ -1,7 +1,7 @@
 import { writePsd, type BlendMode, type Layer as PsdLayer } from "ag-psd";
 import { FabricImage, IText } from "fabric";
 import { zipSync } from "fflate";
-import { api } from "./api";
+import { api, type TextInfo } from "./api";
 import { TEXT_BASELINE, type Editor, type EditorLayer } from "./editor";
 
 interface Baked {
@@ -75,6 +75,15 @@ function textPlacement(object: IText): { matrix: number[]; content: string } {
   return { matrix: [a, b, c, d, a * x + c * y + e, b * x + d * y + f], content: object.text };
 }
 
+/** The same for a text layer still showing its original pixels. */
+function rasterTextPlacement(layer: EditorLayer, text: TextInfo): number[] {
+  const radians = (text.angle * Math.PI) / 180;
+  const [cos, sin] = [Math.cos(radians), Math.sin(radians)];
+  const x = text.x + layer.object.left - layer.home.left;
+  const y = text.y + layer.object.top - layer.home.top;
+  return [cos * text.scaleX, sin * text.scaleX, -sin, cos, x, y];
+}
+
 function save(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const link = Object.assign(document.createElement("a"), { href: url, download: filename });
@@ -106,13 +115,16 @@ export function buildPsd(editor: Editor): ArrayBuffer {
       opacity: layer.object.opacity,
       blendMode: layer.blendMode as BlendMode,
     };
-    if (layer.object instanceof IText && layer.text) {
-      const { matrix, content } = textPlacement(layer.object);
+    if (layer.text) {
+      const { matrix, content } =
+        layer.object instanceof IText
+          ? textPlacement(layer.object)
+          : { matrix: rasterTextPlacement(layer, layer.text), content: layer.text.content };
       const [r, g, b] = layer.text.color;
       psdLayer.text = {
         text: content,
         transform: matrix,
-        style: { font: { name: layer.text.postScriptName }, fontSize: layer.object.fontSize, fillColor: { r, g, b } },
+        style: { font: { name: layer.text.postScriptName }, fontSize: layer.text.fontSize, fillColor: { r, g, b } },
       };
     }
     children.push(psdLayer);

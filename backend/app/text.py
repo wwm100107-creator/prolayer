@@ -17,6 +17,13 @@ from .pipeline import Layer, _bbox, _dilate, _pad_box, _trim, inpaint_region
 log = logging.getLogger("prolayer")
 
 MIN_CONFIDENCE = 0.4
+# Isolated words have nothing around them to misread, so even a shaky reading
+# of a display face is worth offering: its pixels stay on screen until edited.
+MIN_WORD_CONFIDENCE = 0.15
+MIN_WORD_LETTERS = 2
+WORD_READ_SCALES = (1,)
+WORD_CONFIDENCE_WEIGHT = 0.2
+STRETCH_TOLERANCE = 0.05
 MIN_INK_OVERLAP = 0.55
 MIN_LINE_HEIGHT = 10
 MIN_CONTRAST = 40.0
@@ -48,6 +55,9 @@ FONTS = [
     Font("calibri.ttf", "Calibri", "Calibri", 400),
     Font("calibrib.ttf", "Calibri", "Calibri-Bold", 700),
     Font("impact.ttf", "Impact", "Impact", 400),
+    Font("ariblk.ttf", "Arial Black", "Arial-Black", 900),
+    Font("seguibl.ttf", "Segoe UI Black", "SegoeUI-Black", 900),
+    Font("trebucbd.ttf", "Trebuchet MS", "TrebuchetMS-Bold", 700),
 ]
 
 
@@ -70,11 +80,13 @@ def _render_ink(font: ImageFont.FreeTypeFont, text: str) -> tuple[np.ndarray, in
     return ink[y0:y1, x0:x1], x0 - origin[0], y1 - origin[1]
 
 
-def match_font(ink: np.ndarray, text: str) -> tuple[Font, float, float, float, float]:
+def match_font(ink: np.ndarray, text: str) -> tuple[Font, float, float, float, float, float]:
     """Best installed font for this line of ink.
 
-    Returns (font, size, x, y, overlap) with x/y the baseline start in `ink`
-    coordinates. Each candidate is sized to the width of the ink, then scored.
+    Returns (font, size, x, y, overlap, horizontal scale) with x/y the baseline
+    start in `ink` coordinates. Each candidate is sized to the width of the
+    ink, then scored. A display face no installed font matches is sized to the
+    ink's height and stretched to its width, so edited words fill the same space.
     """
     x0, y0, x1, y1 = _bbox(ink)
     width, height = x1 - x0, y1 - y0
@@ -99,8 +111,18 @@ def match_font(ink: np.ndarray, text: str) -> tuple[Font, float, float, float, f
         if best is None or score > best[0]:
             best = (score, candidate, size, x0 - bearing, y1 - descent, float(overlap))
     if best is None:  # no known font on this machine: estimate from the ink
-        return FONTS[0], height / 0.72, float(x0), float(y1), 1.0
-    return best[1], best[2], best[3], best[4], best[5]
+        return FONTS[0], height / 0.72, float(x0), float(y1), 1.0, 1.0
+    _, font, size, x, y, overlap = best
+    path = str(FONT_DIR / font.file)
+    measured = _render_ink(ImageFont.truetype(path, max(1, round(size))), text)
+    if measured is not None and abs(measured[0].shape[0] / height - 1) > STRETCH_TOLERANCE:
+        size *= height / measured[0].shape[0]
+        fitted = _render_ink(ImageFont.truetype(path, max(1, round(size))), text)
+        if fitted is not None:
+            glyphs, bearing, descent = fitted
+            stretch = width / glyphs.shape[1]
+            return font, size, x0 - bearing * stretch, y1 - descent, overlap, stretch
+    return font, size, x, y, overlap, 1.0
 
 
 def _separate(crop: np.ndarray, rim: int) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
@@ -158,7 +180,7 @@ def extract_text(rgb: np.ndarray) -> tuple[list[Layer], np.ndarray]:
         if not (alpha > 0.5).any():
             continue
 
-        font, font_size, baseline_x, baseline_y, overlap = match_font(alpha > 0.5, content)
+        font, font_size, baseline_x, baseline_y, overlap, stretch = match_font(alpha > 0.5, content)
         # Misread words and display fonts render nothing like the ink. Replacing
         # them would corrupt the picture, so they stay graphics for the segmenter.
         if overlap < MIN_INK_OVERLAP:
@@ -186,6 +208,7 @@ def extract_text(rgb: np.ndarray) -> tuple[list[Layer], np.ndarray]:
             "postScriptName": font.postscript,
             "fontWeight": font.weight,
             "fontSize": round(font_size, 2),
+            "scaleX": round(stretch, 4),
             "color": [int(c) for c in np.clip(foreground, 0, 255)],
             "angle": round(angle, 2),
             "x": round(float(origin[0]), 2),
@@ -200,3 +223,55 @@ def extract_text(rgb: np.ndarray) -> tuple[list[Layer], np.ndarray]:
     if not layers:
         return [], rgb
     return layers, inpaint_region(rgb, hole)
+
+
+def label_words(layers: list[Layer]) -> None:
+    """Reads the words the first OCR pass could not, now that they stand alone.
+
+    A headline over busy artwork is hard to read in place. Once segmentation
+    has lifted it out, the same letters sit on plain white. The layer keeps its
+    exact pixels and simply gains the words, so it can be edited later.
+    """
+    for layer in layers:
+        if not layer.is_word or layer.kind != "raster":
+            continue
+        rgba = layer.rgba
+        alpha = rgba[..., 3:].astype(np.float32) / 255
+        picture = np.clip(alpha * rgba[..., :3] + (1 - alpha) * 255, 0, 255).astype(np.uint8)
+        pad = max(8, rgba.shape[0] // 4)
+        framed = cv2.copyMakeBorder(picture, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        ink = rgba[..., 3] > 127
+        if not ink.any():
+            continue
+        # Readings disagree between sizes; the right one draws the same shapes.
+        best: tuple[float, str, tuple] | None = None
+        for scale in WORD_READ_SCALES:
+            big = cv2.resize(framed, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale > 1 else framed
+            readings = sorted(engine.read_text(big), key=lambda item: float(np.array(item[0])[:, 0].min()))
+            content = " ".join(item[1].strip() for item in readings).strip()
+            if not readings or sum(character.isalnum() for character in content) < MIN_WORD_LETTERS:
+                continue
+            confidence = float(np.mean([item[2] for item in readings]))
+            if confidence < MIN_WORD_CONFIDENCE:
+                continue
+            match = match_font(ink, content)
+            score = match[4] + WORD_CONFIDENCE_WEIGHT * confidence
+            if best is None or score > best[0]:
+                best = (score, content, match)
+        if best is None:
+            continue
+        _, content, (font, font_size, x, y, _, stretch) = best
+        layer.kind = "text"
+        layer.name = content
+        layer.text = {
+            "content": content,
+            "fontFamily": font.family,
+            "postScriptName": font.postscript,
+            "fontWeight": font.weight,
+            "fontSize": round(font_size, 2),
+            "scaleX": round(stretch, 4),
+            "color": [int(c) for c in np.median(rgba[ink][:, :3], axis=0)],
+            "angle": 0.0,
+            "x": round(layer.left + float(x), 2),
+            "y": round(layer.top + float(y), 2),
+        }

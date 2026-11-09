@@ -317,6 +317,9 @@ def decompose(session_id: str, request: DecomposeRequest) -> dict:
             layers, background = pipeline.decompose(
                 source, embeddings, request.detail, request.max_layers, request.edge, request.shadow, report
             )
+            if request.text:
+                report("Đang đọc lại chữ đã tách", 0.99)
+                text.label_words(layers)
             layers += text_layers
         finally:
             report("", 0.0)
