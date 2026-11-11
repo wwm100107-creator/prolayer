@@ -72,6 +72,12 @@ EXTRA_STEP = {"coarse": 0.08, "medium": 0.05, "fine": 0.035}
 PART_STEP = {"coarse": 0.3, "medium": 0.2, "fine": 0.12}
 # Ground and ceiling run along the frame and always look nearer than the far wall.
 EXTRA_MAX_FRAME = 0.25
+LYING_MAX_FRAME = 0.05
+LYING_SOLID = 0.8
+# With no depth to back it up, the name alone must carry the decision.
+LYING_SURE = 0.85
+LYING_EDGE_PERCENTILE = 25
+LYING_CRISP = 60.0
 EXTRA_MIN_AREA = {"coarse": 0.01, "medium": 0.003, "fine": 0.0015}
 EXTRA_INSIDE = 0.85
 EXTRA_MIN_SHARE = 0.02
@@ -279,6 +285,7 @@ def _numbered(names: list[str]) -> list[str]:
 
 def photo_layers(
     scene: Scene,
+    rgb: np.ndarray,
     objects: list[np.ndarray],
     cells: list[np.ndarray],
     detail: str,
@@ -345,6 +352,7 @@ def photo_layers(
 
     # Objects without a class name, standing out from what holds them.
     taken = np.zeros((height, width), bool)
+    lying: list[np.ndarray] = []
     for candidate in sorted(objects, key=lambda mask: -int(mask.sum())):
         area = int(candidate.sum())
         if area < EXTRA_MIN_AREA[detail] * pixels or (candidate & taken).sum() > EXTRA_MAX_TAKEN * area:
@@ -356,7 +364,8 @@ def photo_layers(
         if shares[best] < EXTRA_INSIDE * area:
             continue
         holder_area = int(holder.sum())
-        if not EXTRA_MIN_SHARE * holder_area <= area <= EXTRA_MAX_SHARE * holder_area:
+        # A part must be a fair share of its object; a thing on the backdrop need not be.
+        if area > EXTRA_MAX_SHARE * holder_area or (best > 0 and area < EXTRA_MIN_SHARE * holder_area):
             continue
         part = candidate & holder
         measured = _step(depth, part, holder, ring)
@@ -366,6 +375,9 @@ def photo_layers(
         frame = np.concatenate([part[0], part[-1], part[:, 0], part[:, -1]]).sum() / (height + width)
         log.debug("extra area=%.4f holder=%d step=%.3f held=%.2f frame=%.2f", area / pixels, best, step, held, frame)
         if held < EXTRA_MIN_HELD:
+            continue
+        if best == 0 and step < EXTRA_STEP[detail] and frame <= LYING_MAX_FRAME:
+            lying.append(part)
             continue
         if best == 0 and (step < EXTRA_STEP[detail] or frame > EXTRA_MAX_FRAME):
             continue
@@ -378,6 +390,32 @@ def photo_layers(
         masks.append(part)
         names.append(UNNAMED)
         whats.append("")
+        taken |= part
+
+    # A coin on a table stands no nearer than the table. It is an object all the
+    # same if it is compact and CLIP can say what it is.
+    from . import recognise
+
+    grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    edges = cv2.dilate(np.hypot(cv2.Sobel(grey, cv2.CV_32F, 1, 0), cv2.Sobel(grey, cv2.CV_32F, 0, 1)), np.ones((5, 5), np.uint8))
+    compact = []
+    for part in lying:
+        hull = np.zeros((height, width), np.uint8)
+        cv2.fillConvexPoly(hull, cv2.convexHull(cv2.findNonZero(part.astype(np.uint8))), 1)
+        outline = _dilate(part, 1) & ~_erode(part, 1)
+        # A blur in the backdrop has a shape too, but no edge: an object's outline is crisp all round.
+        crisp = float(np.percentile(edges[outline], LYING_EDGE_PERCENTILE))
+        log.debug("lying area=%.4f solid=%.2f crisp=%.0f", part.sum() / pixels, part.sum() / max(int(hull.sum()), 1), crisp)
+        if part.sum() >= LYING_SOLID * hull.sum() and crisp >= LYING_CRISP:
+            compact.append(part)
+    for part, found in zip(compact, recognise.recognise(rgb, compact, LYING_SURE)):
+        if found is None or (part & taken).sum() > EXTRA_MAX_TAKEN * part.sum():
+            continue
+        part = part & ~taken
+        background &= ~part
+        masks.append(part)
+        names.append(found[1])
+        whats.append("a " + found[0])
         taken |= part
 
     # SAM may see a rim and the dome inside it as two objects. Unnamed objects

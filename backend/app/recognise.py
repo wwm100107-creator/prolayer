@@ -88,7 +88,9 @@ def _cutout(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return cv2.resize(square, (CROP_SIDE, CROP_SIDE), interpolation=cv2.INTER_AREA)
 
 
-def recognise(rgb: np.ndarray, masks: list[np.ndarray]) -> list[tuple[str, str] | None]:
+def recognise(
+    rgb: np.ndarray, masks: list[np.ndarray], min_share: float = MIN_SHARE
+) -> list[tuple[str, str] | None]:
     """For each mask, (English word, Vietnamese name), or None when unsure."""
     if not masks:
         return []
@@ -103,6 +105,6 @@ def recognise(rgb: np.ndarray, masks: list[np.ndarray]) -> list[tuple[str, str] 
         together = float(sum(share[words.index(other)] for other in kind))
         rival = max(float(share[i]) for i, other in enumerate(words) if other not in kind)
         log.debug("recognise %s %.2f, rival %.2f", word, together, rival)
-        sure = together >= MIN_SHARE and together - rival >= MIN_LEAD
+        sure = together >= min_share and together - rival >= MIN_LEAD
         out.append((word, WORDS[word]) if sure and WORDS[word] else None)
     return out

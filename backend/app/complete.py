@@ -45,7 +45,10 @@ ELLIPSE_HOLDS = 0.95
 RECTANGLE_MIN_POINTS = 64
 RECTANGLE_MIN_MISSING = 0.01
 RECTANGLE_OPEN = 0.03
-RECTANGLE_EDGE = 0.6
+RECTANGLE_EDGE = 0.7
+RIM_SHARE = 0.1
+RIM_MAX = 8
+FRINGE_SHARE = 0.02
 # A concave shape likely carries on across a bay this wide, as a share of its size.
 BAY = 0.2
 # What stands in front shades the object next to it: the guess takes its colours from beyond.
@@ -88,13 +91,34 @@ def _fill_holes(mask: np.ndarray) -> np.ndarray:
     return filled > 0
 
 
+def _covering(mask: np.ndarray, occluders: np.ndarray) -> np.ndarray:
+    """What hides the object, with the outline drawn around it.
+
+    A badge often has a rim in the page's colour. The rim belongs to no layer,
+    yet it hides what lies under the badge just the same.
+    """
+    x0, y0, x1, y1 = _bbox(mask)
+    rim = int(np.clip(min(x1 - x0, y1 - y0) * RIM_SHARE, GAP, RIM_MAX))
+    return _dilate(occluders, rim)
+
+
+def _solid(mask: np.ndarray) -> np.ndarray:
+    """The object without the threads and soft fringe a mask picks up at its edge."""
+    x0, y0, x1, y1 = _bbox(mask)
+    reach = max(2, int(min(x1 - x0, y1 - y0) * FRINGE_SHARE))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1, 2 * reach + 1))
+    opened = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
+    return opened if opened.any() else mask
+
+
 def fit_ellipse(mask: np.ndarray, occluders: np.ndarray) -> np.ndarray | None:
     """The ellipse a plate, wheel or ball would complete to, if the part of
     its outline that nothing hides lies on one."""
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    covering = _covering(mask, occluders)
+    contours, _ = cv2.findContours(_solid(mask).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     outline = max(contours, key=cv2.contourArea)[:, 0, :]
     height, width = mask.shape
-    near = _dilate(occluders, GAP + 1)
+    near = _dilate(covering, 2)
     xs, ys = outline[:, 0], outline[:, 1]
     # The frame cuts shapes off too: its edge says nothing about the outline.
     free = ~near[ys, xs] & (xs > 0) & (ys > 0) & (xs < width - 1) & (ys < height - 1)
@@ -117,7 +141,7 @@ def fit_ellipse(mask: np.ndarray, occluders: np.ndarray) -> np.ndarray | None:
     # It must hold the object, and the object must fill what is not hidden.
     if (mask & shape).sum() < ELLIPSE_HOLDS * mask.sum():
         return None
-    if (shape & ~mask & ~occluders).sum() > (1 - ELLIPSE_HOLDS) * shape.sum():
+    if (shape & ~mask & ~covering).sum() > (1 - ELLIPSE_HOLDS) * shape.sum():
         return None
     return shape
 
@@ -125,7 +149,7 @@ def fit_ellipse(mask: np.ndarray, occluders: np.ndarray) -> np.ndarray | None:
 def fit_rectangle(mask: np.ndarray, occluders: np.ndarray) -> np.ndarray | None:
     """The rectangle a card or panel would complete to, if all that is missing
     from it lies under something else."""
-    points = cv2.findNonZero(mask.astype(np.uint8))
+    points = cv2.findNonZero(_solid(mask).astype(np.uint8))
     if points is None or len(points) < RECTANGLE_MIN_POINTS:
         return None
     box = cv2.boxPoints(cv2.minAreaRect(points))
@@ -136,11 +160,12 @@ def fit_rectangle(mask: np.ndarray, occluders: np.ndarray) -> np.ndarray | None:
     if missing.sum() < RECTANGLE_MIN_MISSING * shape.sum():
         return None
     # Rounded corners and soft edges leave a little of the rectangle open.
-    if (missing & ~occluders).sum() > RECTANGLE_OPEN * shape.sum():
+    if (missing & ~_covering(mask, occluders)).sum() > RECTANGLE_OPEN * shape.sum():
         return None
     # A card runs along most of its rectangle's edge; a figure only touches its box here and there.
+    # A soft shadow under the card pushes the rectangle a few pixels out, so near counts.
     edge = shape & ~cv2.erode(shape.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
-    if (edge & mask).sum() < RECTANGLE_EDGE * edge.sum():
+    if (edge & _dilate(mask, RIM_MAX)).sum() < RECTANGLE_EDGE * edge.sum():
         return None
     return shape
 

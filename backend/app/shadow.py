@@ -26,6 +26,13 @@ SOFT_EDGE_RATIO = 0.2
 HARD_EDGE_PERCENTILE = 80
 MIN_SAME_HUE = 0.9
 MAX_SURFACE_DETAIL = 6.0
+PAGE_SHADOW_MIN_PIXELS = 64
+# Lightness change per pixel that counts as an edge, how far around a shadow to
+# look, and how much of that surround may be edge.
+PAGE_EDGE_STEP = 3.0
+PAGE_EVEN = 2.0
+PAGE_SHADOW_RING = 4
+PAGE_SHADOW_EDGED = 0.6
 
 
 def _gradient(lightness: np.ndarray) -> np.ndarray:
@@ -143,6 +150,49 @@ def without_shadow_masks(rgb: np.ndarray, masks: list[np.ndarray]) -> list[np.nd
         if keep:
             kept.append(mask)
     return kept
+
+
+def on_page(rgb: np.ndarray, page: np.ndarray, taken: np.ndarray) -> np.ndarray:
+    """Shadow opacity on the plain page of a design, read off the page's own colour.
+
+    The page's colour is known there, so no lit surface has to be guessed. A
+    soft shadow keeps the page's hue, is darker, and fades into the page. A
+    pale shape drawn on the page is darker too, but it ends at an edge all the
+    way round. `taken` is what objects already cover.
+    """
+    height, width = rgb.shape[:2]
+    none = np.zeros((height, width), np.float32)
+    if not page.any():
+        return none
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    low, lit, high = np.percentile(lab[page], (25, 50, 75), axis=0)
+    # On a page that shades from one colour to another, darker says nothing.
+    if float((high - low).max()) > PAGE_EVEN:
+        return none
+    # A shadow layer multiplies colour, so its strength is read from colour, not lightness.
+    paper = np.median(rgb[page], axis=0).astype(np.float32)
+    darkness = np.clip(1 - (rgb.astype(np.float32).sum(axis=2) + 1) / (float(paper.sum()) + 1), 0, 1)
+    chroma = np.hypot(lab[..., 1] - lit[1], lab[..., 2] - lit[2])
+    crisp = _dilate(_gradient(lab[..., 0]) >= PAGE_EDGE_STEP, 2)
+    # Cut along every edge, a shadow comes apart from the things it touches.
+    like = ~taken & ~crisp & (darkness >= ALPHA_EPS) & (darkness <= MAX_ALPHA) & (chroma <= MAX_CHROMA_SHIFT)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(like.astype(np.uint8), connectivity=8)
+    solid = taken | crisp
+    keep = np.zeros(count, bool)
+    reach = PAGE_SHADOW_RING
+    for label in range(1, count):
+        if stats[label, cv2.CC_STAT_AREA] < PAGE_SHADOW_MIN_PIXELS:
+            continue
+        x, y, w, h = (stats[label, key] for key in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
+        x0, y0, x1, y1 = max(0, x - reach), max(0, y - reach), min(width, x + w + reach), min(height, y + h + reach)
+        part = labels[y0:y1, x0:x1] == label
+        around = _dilate(part, reach) & ~part
+        # Something has to cast it, yet most of its outline has to fade away.
+        if not (around & solid[y0:y1, x0:x1]).any():
+            continue
+        ring = around & ~taken[y0:y1, x0:x1]
+        keep[label] = ring.sum() >= 8 and float(crisp[y0:y1, x0:x1][ring].mean()) <= PAGE_SHADOW_EDGED
+    return np.where(keep[labels], darkness, 0).astype(np.float32)
 
 
 def relight(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:

@@ -20,6 +20,8 @@ from transformers import (
     AutoModelForDepthEstimation,
     Mask2FormerForUniversalSegmentation,
     Sam2ImageProcessor,
+    TrOCRProcessor,
+    VisionEncoderDecoderModel,
     Sam2Model,
     VitMatteForImageMatting,
     VitMatteImageProcessor,
@@ -32,6 +34,7 @@ VITMATTE_ID = os.environ.get("PROLAYER_VITMATTE", "hustvl/vitmatte-base-composit
 PANOPTIC_ID = os.environ.get("PROLAYER_PANOPTIC", "facebook/mask2former-swin-large-coco-panoptic")
 DEPTH_ID = os.environ.get("PROLAYER_DEPTH", "depth-anything/Depth-Anything-V2-Small-hf")
 RECOGNISER_ID = os.environ.get("PROLAYER_RECOGNISER", "openai/clip-vit-base-patch16")
+LINE_READER_ID = os.environ.get("PROLAYER_LINE_READER", "microsoft/trocr-base-printed")
 PAINTER_ID = os.environ.get("PROLAYER_PAINTER", "Lykon/dreamshaper-8-inpainting")
 LAMA_URL = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
 LAMA_MD5 = "e3aa4aaa15225a33ec84f9f4bc47e500"
@@ -85,6 +88,8 @@ class Engine:
         self._depth_processor = None
         self._painter = None
         self._recogniser = None
+        self._line_reader = None
+        self._line_reader_processor = None
         self._recogniser_processor = None
         self._word_features: dict[tuple, torch.Tensor] = {}
         self.error: str | None = None
@@ -101,6 +106,7 @@ class Engine:
             self._load_depth()
             self._load_painter()
             self._load_recogniser()
+            self._load_line_reader()
             self._load_ocr()
         except Exception as error:  # surfaced to the UI through /api/health
             log.exception("Model preload failed")
@@ -175,6 +181,14 @@ class Engine:
                 self._recogniser = model.half() if self.device.type == "cuda" else model
         return self._recogniser
 
+    def _load_line_reader(self):
+        with self.gpu:
+            if self._line_reader is None:
+                self._line_reader_processor = TrOCRProcessor.from_pretrained(LINE_READER_ID)
+                model = VisionEncoderDecoderModel.from_pretrained(LINE_READER_ID).to(self.device).eval()
+                self._line_reader = model.half() if self.device.type == "cuda" else model
+        return self._line_reader
+
     def _load_ocr(self):
         with self.gpu:
             if self._ocr is None:
@@ -188,6 +202,17 @@ class Engine:
         reader = self._load_ocr()
         with self.gpu:
             return reader.readtext(rgb, paragraph=False)
+
+    @torch.inference_mode()
+    def read_line(self, rgb: np.ndarray) -> str:
+        """One line of print as TrOCR reads it. It knows display type well, but no Vietnamese tones."""
+        from PIL import Image
+
+        model = self._load_line_reader()
+        with self.gpu:
+            pixels = self._line_reader_processor(images=Image.fromarray(rgb), return_tensors="pt").pixel_values
+            tokens = model.generate(pixels.to(self.device, model.dtype), max_new_tokens=48, num_beams=4)
+        return self._line_reader_processor.batch_decode(tokens, skip_special_tokens=True)[0].strip()
 
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=torch.float16, enabled=self.device.type == "cuda")

@@ -38,6 +38,9 @@ PAGE_COLOUR_DISTANCE = 7.0
 # Finding what the point grid missed.
 GAP_ROUNDS = 6
 SHADOW_CLEARANCE = 12
+SHADOW_MIN_PIXELS = 64
+SHADOW_PROVEN = 0.6
+SHADOW_EDGE = 3
 MAX_GAP_LAYERS = 24
 GAP_MARGIN = 2
 GAP_MIN_AREA = 0.001
@@ -47,6 +50,7 @@ PAGE_EDGE = 3.0
 # Drawn art has crisp edges, so the matting band can be much narrower.
 FLAT_EDGE_SCALE = 0.4
 CRUMB_MIN_PIXELS = 16
+LEFTOVER_MIN_AREA = 0.004
 GAP_MIN_SCORE = 0.5
 GAP_MIN_NEW = 0.6
 GAP_MAX_PAGE = 0.1
@@ -90,6 +94,13 @@ SCATTERED_FILL = 0.02
 # layer, and clearly more of it shows than is hidden.
 CUT_SEEN = 1.5
 CUT_MIN_PIXELS = 64
+RIM_REACH = 8
+CUT_COVER = 0.3
+ON_TOP_SHARE = 0.5
+# A band lies flush with a panel when their edges meet within this many pixels,
+# and it is a plain band when it fills this much of its own box.
+FLUSH_GAP = 5
+FLUSH_FILL = 0.9
 CUT_MIN_SHARE = 0.02
 PHOTO_HULL_EXPLAINS = 0.9
 LEARNED_COLOUR_SCALE = 0.04
@@ -109,6 +120,15 @@ WORD_MAX_GAP = 1.2
 # Looser than for letters: a glyph with a drop shadow has a different median.
 WORD_COLOUR_DISTANCE = 60.0
 STRAY_REACH = 6
+# An accent: how far above its word it may start, how far into the word's top it
+# may dip, how alike in colour, and how small.
+MARK_REACH = 0.6
+MARK_OVERLAP = 0.25
+MARK_COLOUR = 12.0
+MARK_MIN_PIXELS = 6
+MARK_MAX_SHARE = 0.08
+MARK_MAX_HEIGHT = 0.45
+MARK_NICK = 0.15
 LINE_MARGIN = 0.12
 GLYPH_COLOUR_DISTANCE = 12.0
 
@@ -686,11 +706,62 @@ def _join_cut_pieces(
     return [mask for mask, live in zip(masks, alive) if live] + [m for m in masks if id(m) in word_ids]
 
 
-def _order_by_cuts(visible: list[np.ndarray], word_ids: set[int]) -> list[np.ndarray]:
+def _flush_extension(
+    strip: np.ndarray, neighbour: np.ndarray, whole: np.ndarray, covered: np.ndarray
+) -> np.ndarray | None:
+    """How far a band carries on under what hides it, read from the panel it lies flush with.
+
+    A card's header ends where another card covers it, and its own outline
+    cannot say whether it went further. The body below it can: it completes to
+    a rectangle, and a header flush with one side of that rectangle spans it.
+    """
+    sx0, sy0, sx1, sy1 = _bbox(strip)
+    # Only a plain band is extended this way.
+    if strip.sum() < FLUSH_FILL * (sx1 - sx0) * (sy1 - sy0):
+        return None
+    nx0, ny0, nx1, ny1 = _bbox(neighbour)
+    wx0, wy0, wx1, wy1 = _bbox(whole)
+    # Each end either meets the panel's edge already or carries on to it under something.
+    ends: list[np.ndarray] = []
+    if min(abs(sy1 - ny0), abs(ny1 - sy0)) <= FLUSH_GAP and min(sx1, wx1) - max(sx0, wx0) >= 0.8 * (sx1 - sx0):
+        # Stacked: the band grows sideways.
+        spans = [(slice(sy0, sy1), slice(wx0, sx0)), (slice(sy0, sy1), slice(sx1, wx1))]
+        gaps = [sx0 - wx0, wx1 - sx1]
+    elif min(abs(sx1 - nx0), abs(nx1 - sx0)) <= FLUSH_GAP and min(sy1, wy1) - max(sy0, wy0) >= 0.8 * (sy1 - sy0):
+        # Side by side: it grows up and down instead.
+        spans = [(slice(wy0, sy0), slice(sx0, sx1)), (slice(sy1, wy1), slice(sx0, sx1))]
+        gaps = [sy0 - wy0, wy1 - sy1]
+    else:
+        return None
+    for span, gap in zip(spans, gaps):
+        if gap <= 2 * FLUSH_GAP:
+            continue
+        end = np.zeros(strip.shape, bool)
+        end[span] = True
+        # An end that stops in the open really is the end of the band.
+        if (end & covered).sum() < FLUSH_FILL * end.sum():
+            return None
+        ends.append(end)
+    if not ends:
+        return None
+    extension = np.logical_or.reduce(ends)
+    return extension
+
+
+def _order_by_cuts(
+    visible: list[np.ndarray], page: np.ndarray, word_ids: set[int]
+) -> tuple[list[np.ndarray], dict[int, np.ndarray]]:
     """Moves a layer below the one that cuts into its shape.
+
+    Also returns, by mask identity, hidden parts that only a neighbour gives
+    away: see `_flush_extension`.
 
     A rectangle with a corner missing, or a disc with a straight side, lies
     behind whatever fills the missing part. Size says nothing about that.
+
+    A rim in the page's colour around the layer on top hides the lower shape
+    too, so it becomes part of the layer on top: otherwise the page would show
+    through the completed shape wherever the rim ran.
     """
     from .complete import known_shape
 
@@ -698,26 +769,43 @@ def _order_by_cuts(visible: list[np.ndarray], word_ids: set[int]) -> list[np.nda
     others = np.logical_or.reduce(visible)
     order = list(range(len(visible)))
     shapes: dict[int, np.ndarray] = {}
+    wholes: dict[int, np.ndarray] = {}
     for i, mask in enumerate(visible):
         if id(mask) in word_ids:
             continue
         # A hull proves nothing here: on a busy picture something lies behind every gap.
+        whole = known_shape(mask, others & ~mask, None)
         # Lines printed on a card show the layer below through it, yet cut nothing off it.
-        shape = known_shape(mask, others & ~mask, None) & ~_fill_interior(mask)
+        shape = whole & ~_fill_interior(mask)
         if shape.sum() >= max(CUT_MIN_PIXELS, CUT_MIN_SHARE * mask.sum()) and mask.sum() >= CUT_SEEN * shape.sum():
-            shapes[i] = shape
+            shapes[i], wholes[i] = shape, whole | mask
+    hints: dict[int, np.ndarray] = {}
+    for i, mask in enumerate(visible):
+        if i in shapes or id(mask) in word_ids:
+            continue
+        for a, whole in wholes.items():
+            extension = _flush_extension(mask, visible[a], whole, others & ~mask)
+            if extension is not None:
+                shapes[i] = hints[id(mask)] = extension
+                break
     below: list[tuple[int, int]] = []
     for a, shape in shapes.items():
         for b, mask in enumerate(visible):
             if b == a or id(mask) in word_ids:
                 continue
-            # What lies within a panel's outline lies on the panel, never behind it.
-            if (_hull(mask) & visible[a]).sum() >= NESTED_SHARE * visible[a].sum():
+            # What shows within another layer's outline lies on that layer, never behind it.
+            if (_hull(mask) & visible[a]).sum() >= ON_TOP_SHARE * visible[a].sum():
                 continue
             under = int((shape & mask).sum())
             back = int((shapes[b] & visible[a]).sum()) if b in shapes else 0
-            if under >= max(CUT_MIN_PIXELS, CUT_MIN_SHARE * visible[a].sum()) and under > 2 * back:
+            # A speech bubble's tail leaves its box half empty, but no one thing fills the gap.
+            if under >= max(CUT_MIN_PIXELS, CUT_COVER * shape.sum()) and under > 2 * back:
                 below.append((a, b))
+                log.debug("cut: %s lies under %s (%d px)", _bbox(visible[a]), _bbox(mask), under)
+                rim = shape & page & ~others & _dilate(mask, RIM_REACH)
+                if rim.any():
+                    # In place: other parts of the pipeline know this mask by its identity.
+                    mask |= rim
     # Each pass fixes at least one broken pair; a cycle of evidence stops it.
     for _ in range(len(below) * 2):
         moved = False
@@ -728,7 +816,7 @@ def _order_by_cuts(visible: list[np.ndarray], word_ids: set[int]) -> list[np.nda
                 moved = True
         if not moved:
             break
-    return [visible[i] for i in order]
+    return [visible[i] for i in order], hints
 
 
 def _claim_fringe(visible: list[np.ndarray], page: np.ndarray, word_ids: set[int]) -> list[np.ndarray]:
@@ -779,6 +867,19 @@ def _seal(rgba: np.ndarray, sealable: np.ndarray) -> np.ndarray:
     rgba[..., :3][empty] = by_label[labels[empty]]
     rgba[..., 3][holes] = 255
     return rgba
+
+
+def _leftover_areas(page: np.ndarray, visible: list[np.ndarray], min_pixels: int) -> list[np.ndarray]:
+    """Large areas no mask claimed, each as a layer of its own.
+
+    A wide shaded area has no even colour to cut along and SAM may not outline
+    it either. It is still part of the picture, and far too large to be a crumb.
+    """
+    covered = np.logical_or.reduce(visible) if visible else np.zeros(page.shape, bool)
+    leftovers = ~page & ~_dilate(covered, GAP_MARGIN)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(leftovers.astype(np.uint8), connectivity=8)
+    large = [label for label in range(1, count) if stats[label, cv2.CC_STAT_AREA] >= min_pixels]
+    return [labels == label for label in sorted(large, key=lambda label: -stats[label, cv2.CC_STAT_AREA])]
 
 
 def _crumbs(page: np.ndarray, visible: list[np.ndarray]) -> np.ndarray | None:
@@ -974,6 +1075,72 @@ def _group_words(rgb: np.ndarray, masks: list[np.ndarray]) -> tuple[list[np.ndar
     return list(groups.values()), {id(groups[root]) for root in words}
 
 
+def _return_marks(
+    rgb: np.ndarray, masks: list[np.ndarray], word_ids: set[int]
+) -> list[tuple[int, int]]:
+    """Gives accents back to the word below them.
+
+    The grave of an À reaches up into the line above, and SAM hands it to
+    whatever letter it touches there. An accent has its own word's colour, sits
+    just above it, and is small. Returns (id of the layer robbed, id of the
+    word) pairs: the word now lies on top of that layer.
+    """
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    height, width = rgb.shape[:2]
+    owner = np.full((height, width), -1, np.int32)
+    for z, mask in enumerate(masks):
+        owner[mask] = z
+    colours = [np.median(lab[mask], axis=0) if mask.any() else np.zeros(3, np.float32) for mask in masks]
+    over: list[tuple[int, int]] = []
+    for w, word in enumerate(masks):
+        if id(word) not in word_ids or not word.any():
+            continue
+        x0, y0, x1, y1 = _bbox(word)
+        line = y1 - y0
+        top, bottom = max(0, y0 - int(line * MARK_REACH)), min(height, y0 + int(line * MARK_OVERLAP))
+        band = np.zeros((height, width), bool)
+        band[top:bottom, x0:x1] = True
+        alike = band & ~word & (np.linalg.norm(lab - colours[w], axis=2) <= MARK_COLOUR)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(alike.astype(np.uint8), connectivity=8)
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if not MARK_MIN_PIXELS <= area <= MARK_MAX_SHARE * word.sum():
+                continue
+            if stats[label, cv2.CC_STAT_HEIGHT] > MARK_MAX_HEIGHT * line:
+                continue
+            part = labels == label
+            holders = owner[part]
+            holder = int(np.bincount(holders[holders >= 0]).argmax()) if (holders >= 0).any() else -1
+            # Its present owner must be of another colour, or this is just more of that owner.
+            if holder >= 0 and float(np.linalg.norm(colours[holder] - colours[w])) <= 2 * MARK_COLOUR:
+                continue
+            # In place: the word is known by the identity of its mask.
+            word |= part
+            for z in np.unique(holders[holders >= 0]):
+                masks[int(z)] &= ~part
+                over.append((id(masks[int(z)]), id(word)))
+    return over
+
+
+def _mend_word(rgba: np.ndarray, mask: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    """Fills the nicks that marks lying on a word left in its letters."""
+    x0, y0, x1, y1 = _bbox(mask)
+    reach = max(2, int((y1 - y0) * MARK_NICK))
+    pad = reach + 1
+    padded = cv2.copyMakeBorder(mask.astype(np.uint8), pad, pad, pad, pad, cv2.BORDER_CONSTANT)
+    closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, _ellipse(reach))[pad:-pad, pad:-pad] > 0
+    nicks = (closed | _fill_interior(mask)) & upper & ~mask
+    if not nicks.any():
+        return rgba
+    rgba = rgba.copy()
+    _, labels = cv2.distanceTransformWithLabels((~mask).astype(np.uint8), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    by_label = np.zeros((int(labels.max()) + 1, 3), np.uint8)
+    by_label[labels[mask]] = rgba[..., :3][mask]
+    rgba[..., :3][nicks] = by_label[labels[nicks]]
+    rgba[..., 3][nicks] = 255
+    return rgba
+
+
 def _trim_to_line(groups: dict[int, np.ndarray], root: int, lines: np.ndarray) -> np.ndarray:
     """Hands pieces of the next text line back: SAM's glyph masks can overlap it."""
     word = groups[root]
@@ -1038,9 +1205,22 @@ def decompose(
     selected = [_upsample(logits[index], width, height) for index in chosen]
 
     page = _find_page(rgb, logits, scores)
+    # The page, plus whatever else no layer should claim.
+    clear = page
+    page_shadow: np.ndarray | None = None
     if page is not None:
         progress("Đang tìm phần còn sót", 0.3)
-        gaps = _fill_gaps(rgb, embeddings, selected, page, max(32, int(pixels * GAP_MIN_AREA)))
+        if with_shadows:
+            from . import shadow
+
+            # A soft shadow is neither page nor object. Counted as page from here on,
+            # it is left for the shadow layers instead of turning into opaque scraps.
+            covered = np.logical_or.reduce(selected) if selected else np.zeros((height, width), bool)
+            page_shadow = shadow.on_page(rgb, page, covered)
+            clear = page | (page_shadow > 0)
+        else:
+            clear = page
+        gaps = _fill_gaps(rgb, embeddings, selected, clear, max(32, int(pixels * GAP_MIN_AREA)))
         selected += gaps
         found_in_gaps = np.logical_or.reduce(gaps) if gaps else np.zeros((height, width), bool)
         regions = _flat_regions(rgb, page)
@@ -1068,7 +1248,7 @@ def decompose(
         for z, index in enumerate(pieces):
             owner[_upsample(logits[index], width, height)] = z
         cells = [owner == z for z in range(len(pieces))]
-        masks, layer_names, layer_whats = scene.photo_layers(understood, objects, cells, detail, max_layers)
+        masks, layer_names, layer_whats = scene.photo_layers(understood, rgb, objects, cells, detail, max_layers)
         visible = []
         for mask, name, what in zip(masks, layer_names, layer_whats):
             mask = _clean_visible(mask, min_pixels)
@@ -1090,8 +1270,11 @@ def decompose(
             owner[mask] = z
         visible = [_clean_visible(owner == z, min_pixels) for z in range(len(selected))]
         visible = [mask for mask in visible if mask.sum() >= min_pixels]
+    marks_over: list[tuple[int, int]] = []
+    shape_hints: dict[int, np.ndarray] = {}
     if visible and not photo:
         visible, word_ids = _group_words(rgb, visible)
+        marks_over = _return_marks(rgb, visible, word_ids)
         if page is not None and detail != "fine":
             visible = _merge_parts(rgb, visible, regions, page, found_in_gaps)
             visible = _join_cut_pieces(rgb, visible, page, word_ids)
@@ -1105,9 +1288,16 @@ def decompose(
                 key=lambda mask: (0, -reach[id(mask)]) if _is_surface(mask, regions, found_in_gaps) else (1, 0)
             )
         if page is not None:
-            visible = _claim_fringe(visible, page, word_ids)
-            visible = _order_by_cuts(visible, word_ids)
-            crumbs = _crumbs(page, visible)
+            visible = _claim_fringe(visible, clear, word_ids)
+            visible = _leftover_areas(clear, visible, int(pixels * LEFTOVER_MIN_AREA)) + visible
+            visible, shape_hints = _order_by_cuts(visible, page, word_ids)
+        # A word whose accents were lying on another layer lies on that layer.
+        for robbed, word in marks_over:
+            ids = [id(mask) for mask in visible]
+            if robbed in ids and word in ids and ids.index(word) < ids.index(robbed):
+                visible.insert(ids.index(robbed), visible.pop(ids.index(word)))
+        if page is not None:
+            crumbs = _crumbs(clear, visible)
         if crumbs is not None:
             visible.append(crumbs)
         names = scene.name_flat_layers(understood, visible)
@@ -1124,7 +1314,19 @@ def decompose(
     if with_shadows and len(visible) > 1:
         from . import shadow
 
-        visible = shadow.without_shadow_masks(rgb, visible)
+        kept = {id(mask) for mask in shadow.without_shadow_masks(rgb, visible)}
+        if len(kept) < len(visible):
+            # A mask is only given up as a shadow if the shadow layers will really
+            # show it again. Otherwise that part of the picture would simply vanish.
+            objects = np.logical_or.reduce([mask for mask in visible if id(mask) in kept])
+            shown = shadow.estimate(rgb, objects)
+            if page is not None:
+                shown = np.maximum(shown, shadow.on_page(rgb, page, objects))
+            visible = [
+                mask
+                for mask in visible
+                if id(mask) in kept or (shown[mask] > shadow.ALPHA_EPS).mean() < SHADOW_PROVEN
+            ]
 
     if not visible:
         return [], rgb.copy()
@@ -1135,8 +1337,12 @@ def decompose(
     for i, mask in enumerate(visible):
         progress("Đang làm mịn biên", 0.3 + 0.45 * i / len(visible))
         alpha, box, radius = matte(rgb, mask, edge * FLAT_EDGE_SCALE if page is not None else edge)
-        alphas.append((alpha, box, radius))
         x0, y0, x1, y1 = box
+        if page is not None:
+            # Drawn shapes are solid up to their last pixel. A sliver the colour of
+            # what lies behind it would otherwise be matted away to nothing.
+            alpha = np.maximum(alpha, (~_dilate(~mask[y0:y1, x0:x1], 1)).astype(np.float32))
+        alphas.append((alpha, box, radius))
         hole[y0:y1, x0:x1] |= alpha > ALPHA_MIN
     # Shadows come off first, or LaMa would extend them across the hole.
     source = rgb
@@ -1147,6 +1353,9 @@ def decompose(
 
         progress("Đang tách bóng đổ", 0.75)
         darkening = shadow.estimate(rgb, hole)
+        if page is not None:
+            # Now that every object is known, the whole of each soft shadow can be told apart.
+            darkening = np.maximum(darkening, shadow.on_page(rgb, page, hole))
         if darkening.any():
             source = shadow.relight(rgb, darkening)
             # Each shadow belongs to the object nearest to it.
@@ -1159,8 +1368,21 @@ def decompose(
             by_label = np.zeros(int(labels.max()) + 1, np.int32)
             by_label[labels[owners >= 0]] = owners[owners >= 0]
             nearest = by_label[labels]
+            cast = darkening
+            if page is not None:
+                # A shadow carries on under what casts it. Stopping at the object's soft
+                # edge leaves a light rim there, and a ring where a silhouette belongs.
+                # The last pixels before the object's edge are mixed with its colour and
+                # tell nothing, so the shadow is carried across them as well.
+                unknown = _dilate(hole, SHADOW_EDGE)
+                levels = np.repeat(np.clip(darkening * 255 + 0.5, 0, 255).astype(np.uint8)[..., None], 3, axis=2)
+                carried = _smooth_fill(levels, ~unknown)[..., 0] / 255.0
+                cast = np.where(unknown, np.maximum(carried, darkening), darkening).astype(np.float32)
             for z in range(len(visible)):
-                layer = shadow.make_layer(np.where(nearest == z, darkening, 0).astype(np.float32), f"Bóng đổ {z + 1}")
+                # Only an object with shadow showing around it has a shadow of its own.
+                if ((nearest == z) & (darkening > shadow.ALPHA_EPS)).sum() < SHADOW_MIN_PIXELS:
+                    continue
+                layer = shadow.make_layer(np.where(nearest == z, cast, 0).astype(np.float32), f"Bóng đổ {z + 1}")
                 if layer is not None:
                     shadow_parts[z] = layer
 
@@ -1185,7 +1407,7 @@ def decompose(
             above |= mask
     uppers.reverse()
     # On a plain page, what belongs to no layer and is not page is a leftover scrap.
-    unowned = ~page & ~np.logical_or.reduce(visible) if page is not None else np.zeros((height, width), bool)
+    unowned = ~clear & ~np.logical_or.reduce(visible) if page is not None else np.zeros((height, width), bool)
 
     # Layers that share a name are told apart by number.
     shared = {name for name in names.values() if list(names.values()).count(name) > 1}
@@ -1242,7 +1464,16 @@ def decompose(
                 rgba, crop_rgb, crop_mask, crop_upper, radius,
                 flat=page is not None,
                 surface=page is not None and _is_surface(mask, regions, found_in_gaps),
+                open_to=~(crop_mask | crop_upper | unowned[y0:y1, x0:x1]),
             )
+
+        elif crop_upper.any():
+            rgba = _mend_word(rgba, crop_mask, crop_upper)
+
+        if id(mask) in shape_hints:
+            hinted = shape_hints[id(mask)] & upper & ~mask
+            if hinted.any():
+                rgba, x0, y0 = _add_hidden(rgba, x0, y0, hinted, _continue_colours(rgb, mask, hinted))
 
         if i in hidden_parts:
             rgba, x0, y0 = _add_hidden(rgba, x0, y0, *hidden_parts[i])
@@ -1335,8 +1566,12 @@ def _extend_under(
     radius: int,
     flat: bool = False,
     surface: bool = False,
+    open_to: np.ndarray | None = None,
 ) -> np.ndarray:
     """Make a layer whole where the layers above hide it.
+
+    `open_to` marks what may show through the layer: the page and the layers
+    below it. An outline drawn around a patch of page stays an outline.
 
     Closes the seam along upper layers' soft edges, and paints enclosed holes
     so that moving the top element does not expose a hole in this one.
@@ -1363,6 +1598,8 @@ def _extend_under(
     if surface:
         # Everything enclosed, including the hairline left between two outlines.
         interior = (interior | _fill_interior(mask | interior)) & ~mask
+        if open_to is not None:
+            interior &= ~open_to
         # Colour from the object on top bleeds a little past its outline.
         near_upper = _dilate(upper, FRINGE)
         if (mask & ~near_upper).any():

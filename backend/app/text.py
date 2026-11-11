@@ -1,6 +1,7 @@
 """Finds text, rebuilds each line as an editable layer, erases it from the picture."""
 from __future__ import annotations
 
+import difflib
 import logging
 import math
 import os
@@ -19,10 +20,7 @@ log = logging.getLogger("prolayer")
 MIN_CONFIDENCE = 0.4
 # Isolated words have nothing around them to misread, so even a shaky reading
 # of a display face is worth offering: its pixels stay on screen until edited.
-MIN_WORD_CONFIDENCE = 0.15
 MIN_WORD_LETTERS = 2
-WORD_READ_SCALES = (1,)
-WORD_CONFIDENCE_WEIGHT = 0.2
 STRETCH_TOLERANCE = 0.05
 MIN_INK_OVERLAP = 0.55
 MIN_LINE_HEIGHT = 10
@@ -30,6 +28,16 @@ MIN_CONTRAST = 40.0
 MAX_TEXT_LAYERS = 60
 FONT_DIR = Path(os.environ.get("PROLAYER_FONT_DIR", r"C:\Windows\Fonts"))
 FIT_SIZE = 64
+# A first reading below this confidence gets a second opinion from TrOCR.
+READ_AGAIN = 0.75
+MIN_WORD_OVERLAP = 0.35
+# Letters that differ only by tone or hat: one reading, many spellings.
+_TONES = (
+    "aàáảãạăằắẳẵặâầấẩẫậ", "eèéẻẽẹêềếểễệ", "iìíỉĩị", "oòóỏõọôồốổỗộơờớởỡợ", "uùúủũụưừứửữự", "yỳýỷỹỵ", "dđ",
+)
+_FAMILY = {letter: family for family in _TONES for letter in family}
+# Shapes one reader takes for another.
+_LOOKALIKE = {"l": "I", "1": "I", "|": "I", "0": "O", "5": "S", "8": "B"}
 
 
 class Font(NamedTuple):
@@ -125,6 +133,42 @@ def match_font(ink: np.ndarray, text: str) -> tuple[Font, float, float, float, f
     return font, size, x, y, overlap, 1.0
 
 
+def _fold(letter: str) -> str:
+    """A letter without tone, case, or the difference between look-alikes."""
+    letter = _LOOKALIKE.get(letter, letter).lower()
+    family = _FAMILY.get(letter)
+    return family[0] if family else letter
+
+
+def _merge_readings(display: str, toned: str, toned_confidence: float) -> str:
+    """One spelling from two readers.
+
+    TrOCR reads heavy display type but knows no Vietnamese: it gives the
+    letters and their case. EasyOCR knows the tones, so where both see the
+    same letter, its tone goes onto TrOCR's letter.
+    """
+    if not display:
+        return toned
+    if not toned or toned_confidence >= READ_AGAIN:
+        return toned or display
+    folded_display, folded_toned = [_fold(c) for c in display], [_fold(c) for c in toned]
+    out = []
+    for tag, a0, a1, b0, b1 in difflib.SequenceMatcher(None, folded_display, folded_toned, autojunk=False).get_opcodes():
+        ours, theirs = display[a0:a1], toned[b0:b1]
+        if tag == "equal":
+            for letter, other in zip(ours, theirs):
+                has_tone = other.lower() in _FAMILY and other.lower() != _FAMILY[other.lower()][0]
+                if has_tone and letter.lower() in _FAMILY:
+                    letter = other.upper() if letter.isupper() else other.lower()
+                out.append(letter)
+        elif theirs and b1 == len(toned) and all(c in "?!.,:;" for c in theirs):
+            # TrOCR turns a closing mark into a letter to finish an English word.
+            out.append(theirs)
+        else:
+            out.append(ours)
+    return "".join(out)
+
+
 def _separate(crop: np.ndarray, rim: int) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Splits a text crop into (text colour, background colour, alpha)."""
     samples = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
@@ -180,6 +224,8 @@ def extract_text(rgb: np.ndarray) -> tuple[list[Layer], np.ndarray]:
         if not (alpha > 0.5).any():
             continue
 
+        if confidence < READ_AGAIN:
+            content = _merge_readings(engine.read_line(crop), content, confidence) or content
         font, font_size, baseline_x, baseline_y, overlap, stretch = match_font(alpha > 0.5, content)
         # Misread words and display fonts render nothing like the ink. Replacing
         # them would corrupt the picture, so they stay graphics for the segmenter.
@@ -243,24 +289,18 @@ def label_words(layers: list[Layer]) -> None:
         ink = rgba[..., 3] > 127
         if not ink.any():
             continue
-        # Readings disagree between sizes; the right one draws the same shapes.
-        best: tuple[float, str, tuple] | None = None
-        for scale in WORD_READ_SCALES:
-            big = cv2.resize(framed, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale > 1 else framed
-            readings = sorted(engine.read_text(big), key=lambda item: float(np.array(item[0])[:, 0].min()))
-            content = " ".join(item[1].strip() for item in readings).strip()
-            if not readings or sum(character.isalnum() for character in content) < MIN_WORD_LETTERS:
-                continue
-            confidence = float(np.mean([item[2] for item in readings]))
-            if confidence < MIN_WORD_CONFIDENCE:
-                continue
-            match = match_font(ink, content)
-            score = match[4] + WORD_CONFIDENCE_WEIGHT * confidence
-            if best is None or score > best[0]:
-                best = (score, content, match)
-        if best is None:
+        # Two readers: EasyOCR knows Vietnamese, TrOCR knows heavy display type.
+        found = sorted(engine.read_text(framed), key=lambda item: float(np.array(item[0])[:, 0].min()))
+        toned = " ".join(item[1].strip() for item in found).strip()
+        confidence = float(np.mean([item[2] for item in found])) if found else 0.0
+        content = _merge_readings(engine.read_line(framed), toned, confidence)
+        if sum(character.isalnum() for character in content) < MIN_WORD_LETTERS:
             continue
-        _, content, (font, font_size, x, y, _, stretch) = best
+        font, font_size, x, y, overlap, stretch = match_font(ink, content)
+        # Shapes that only look like a row of letters draw nothing like any spelling.
+        if overlap < MIN_WORD_OVERLAP:
+            log.info("Keeping %r as a graphic: rendered ink overlap %.2f", content, overlap)
+            continue
         layer.kind = "text"
         layer.name = content
         layer.text = {
