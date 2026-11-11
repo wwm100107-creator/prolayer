@@ -248,6 +248,25 @@ def _order(depth: np.ndarray, layers: list[np.ndarray], width: int) -> list[int]
     return order
 
 
+def _plain(label: str) -> str:
+    """A COCO label as plain words: 'wall-other-merged' is a wall."""
+    for suffix in ("-merged", "-other", "-stuff"):
+        label = label.replace(suffix, "")
+    return "a " + label.replace("-", " ")
+
+
+def what_is(scene: Scene | None, mask: np.ndarray) -> str:
+    """What a layer of flat artwork shows, when one thing covers most of it."""
+    if scene is None:
+        return ""
+    counts = np.bincount(scene.labels[mask], minlength=len(scene.segments))
+    best = int(counts.argmax())
+    segment = scene.segments[best]
+    if segment["thing"] and counts[best] >= 0.5 * mask.sum() and counts[best] >= 0.3 * (scene.labels == best).sum():
+        return _plain(segment["label"])
+    return ""
+
+
 def _numbered(names: list[str]) -> list[str]:
     totals = Counter(names)
     seen: Counter = Counter()
@@ -264,8 +283,9 @@ def photo_layers(
     cells: list[np.ndarray],
     detail: str,
     max_layers: int,
-) -> tuple[list[np.ndarray], list[str]]:
-    """Layer masks bottom to top, and their names, for a photograph.
+) -> tuple[list[np.ndarray], list[str], list[str | None]]:
+    """Layer masks bottom to top, their names, and what each one is in
+    English for the model that redraws hidden parts (None: not a whole object).
 
     `objects` are SAM's whole-object masks, `cells` its finest pieces.
     Whatever is left belongs to the background.
@@ -320,6 +340,7 @@ def photo_layers(
 
     masks = [labels == i for i in layer_ids]
     names = [segments[i]["name"] for i in layer_ids]
+    whats: list[str | None] = [_plain(segments[i]["label"]) for i in layer_ids]
     background = ~np.logical_or.reduce(masks) if masks else np.ones((height, width), bool)
 
     # Objects without a class name, standing out from what holds them.
@@ -356,6 +377,7 @@ def photo_layers(
             masks[best - 1] = masks[best - 1] & ~part
         masks.append(part)
         names.append(UNNAMED)
+        whats.append("")
         taken |= part
 
     # SAM may see a rim and the dome inside it as two objects. Unnamed objects
@@ -374,7 +396,7 @@ def photo_layers(
                     continue
                 if abs(float(np.median(depth[a_side]) - np.median(depth[b_side]))) < SAME_DEPTH:
                     masks[a] = masks[a] | masks[b]
-                    del masks[b], names[b]
+                    del masks[b], names[b], whats[b]
                     merged = True
                     break
             if merged:
@@ -382,8 +404,8 @@ def photo_layers(
 
     # Fine detail: each object also splits into the pieces SAM sees in it.
     if detail == "fine":
-        split_masks, split_names = [], []
-        for mask, name in zip(masks, names):
+        split_masks, split_names, split_whats = [], [], []
+        for mask, name, what in zip(masks, names, whats):
             pieces = []
             rest = mask.copy()
             for cell in cells:
@@ -395,18 +417,22 @@ def photo_layers(
             if len(pieces) < 2:
                 split_masks.append(mask)
                 split_names.append(name)
+                split_whats.append(what)
                 continue
             # What no piece claimed stays with the largest piece.
             pieces.sort(key=lambda piece: -int(piece.sum()))
             pieces[0] = pieces[0] | rest
             split_masks += pieces
             split_names += [f"{name} – phần" for _ in pieces]
-        masks, names = split_masks, split_names
+            # A piece of an object has no hidden part of its own to redraw.
+            split_whats += [None for _ in pieces]
+        masks, names, whats = split_masks, split_names, split_whats
 
     keep = [i for i, mask in enumerate(masks) if mask.any()]
     if len(keep) > max_layers:
         keep = sorted(keep, key=lambda i: -int(masks[i].sum()))[:max_layers]
     masks = [masks[i] for i in keep]
     names = [names[i] for i in keep]
+    whats = [whats[i] for i in keep]
     order = _order(depth, masks, ring)
-    return [masks[i] for i in order], _numbered([names[i] for i in order])
+    return [masks[i] for i in order], _numbered([names[i] for i in order]), [whats[i] for i in order]

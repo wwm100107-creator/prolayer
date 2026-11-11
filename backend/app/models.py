@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import threading
+from contextlib import contextmanager
 import urllib.request
 from pathlib import Path
 from typing import Callable, Sequence
@@ -14,6 +15,8 @@ import numpy as np
 import torch
 from transformers import (
     AutoImageProcessor,
+    CLIPModel,
+    CLIPProcessor,
     AutoModelForDepthEstimation,
     Mask2FormerForUniversalSegmentation,
     Sam2ImageProcessor,
@@ -28,6 +31,8 @@ SAM2_ID = os.environ.get("PROLAYER_SAM2", "facebook/sam2.1-hiera-large")
 VITMATTE_ID = os.environ.get("PROLAYER_VITMATTE", "hustvl/vitmatte-base-composition-1k")
 PANOPTIC_ID = os.environ.get("PROLAYER_PANOPTIC", "facebook/mask2former-swin-large-coco-panoptic")
 DEPTH_ID = os.environ.get("PROLAYER_DEPTH", "depth-anything/Depth-Anything-V2-Small-hf")
+RECOGNISER_ID = os.environ.get("PROLAYER_RECOGNISER", "openai/clip-vit-base-patch16")
+PAINTER_ID = os.environ.get("PROLAYER_PAINTER", "Lykon/dreamshaper-8-inpainting")
 LAMA_URL = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
 LAMA_MD5 = "e3aa4aaa15225a33ec84f9f4bc47e500"
 LAMA_PATH = Path.home() / ".cache" / "prolayer" / "models" / "big-lama.pt"
@@ -39,6 +44,8 @@ MIN_RETRY_SIDE = 512
 # Mask2Former was evaluated at a shortest side of 800.
 PANOPTIC_SIZE = {"shortest_edge": 800, "longest_edge": 1333}
 PANOPTIC_THRESHOLD = 0.5
+PAINT_STEPS = 16
+PAINT_GUIDANCE = 6.5
 GRID_SIDE = 32
 GRID_BATCH = 64
 
@@ -76,6 +83,10 @@ class Engine:
         self._panoptic_processor = None
         self._depth = None
         self._depth_processor = None
+        self._painter = None
+        self._recogniser = None
+        self._recogniser_processor = None
+        self._word_features: dict[tuple, torch.Tensor] = {}
         self.error: str | None = None
 
     # ------------------------------------------------------------------
@@ -88,6 +99,8 @@ class Engine:
             self._load_lama()
             self._load_panoptic()
             self._load_depth()
+            self._load_painter()
+            self._load_recogniser()
             self._load_ocr()
         except Exception as error:  # surfaced to the UI through /api/health
             log.exception("Model preload failed")
@@ -135,6 +148,32 @@ class Engine:
                 self._depth_processor = AutoImageProcessor.from_pretrained(DEPTH_ID)
                 self._depth = AutoModelForDepthEstimation.from_pretrained(DEPTH_ID).to(self.device).eval()
         return self._depth
+
+    def _load_painter(self):
+        with self.gpu:
+            if self._painter is None:
+                from diffusers import StableDiffusionInpaintPipeline
+
+                half = self.device.type == "cuda"
+                painter = StableDiffusionInpaintPipeline.from_pretrained(
+                    PAINTER_ID,
+                    dtype=torch.float16 if half else torch.float32,
+                    variant="fp16" if half else None,
+                    safety_checker=None,
+                    requires_safety_checker=False,
+                )
+                painter.set_progress_bar_config(disable=True)
+                # Its 2GB stay in main memory: `painting` brings them to the GPU when needed.
+                self._painter = painter
+        return self._painter
+
+    def _load_recogniser(self):
+        with self.gpu:
+            if self._recogniser is None:
+                self._recogniser_processor = CLIPProcessor.from_pretrained(RECOGNISER_ID)
+                model = CLIPModel.from_pretrained(RECOGNISER_ID).to(self.device).eval()
+                self._recogniser = model.half() if self.device.type == "cuda" else model
+        return self._recogniser
 
     def _load_ocr(self):
         with self.gpu:
@@ -297,6 +336,83 @@ class Engine:
             inputs = self._depth_processor(images=rgb, return_tensors="pt").to(self.device)
             predicted = model(**inputs).predicted_depth[0].float().cpu().numpy()
         return cv2.resize(predicted, (width, height), interpolation=cv2.INTER_LINEAR)
+
+    # ------------------------------------------------------------------
+    # CLIP
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def match_words(self, images: list[np.ndarray], words: list[str], templates: Sequence[str]) -> np.ndarray:
+        """For each image, how the probability divides among `words`."""
+        model = self._load_recogniser()
+        processor = self._recogniser_processor
+        with self.gpu:
+            key = (tuple(words), tuple(templates))
+            if key not in self._word_features:
+                features = 0
+                for template in templates:
+                    tokens = processor.tokenizer(
+                        [template.format(word) for word in words], padding=True, return_tensors="pt"
+                    ).to(self.device)
+                    pooled = model.text_model(**tokens).pooler_output
+                    features = features + torch.nn.functional.normalize(model.text_projection(pooled), dim=-1)
+                self._word_features[key] = torch.nn.functional.normalize(features, dim=-1)
+            pixels = processor.image_processor(images=images, return_tensors="pt").pixel_values
+            pixels = pixels.to(self.device, model.dtype)
+            seen = torch.nn.functional.normalize(
+                model.visual_projection(model.vision_model(pixel_values=pixels).pooler_output), dim=-1
+            )
+            logits = model.logit_scale.exp() * seen @ self._word_features[key].T
+            return logits.softmax(dim=-1).float().cpu().numpy()
+
+    # ------------------------------------------------------------------
+    # Stable Diffusion inpainting
+    # ------------------------------------------------------------------
+    @contextmanager
+    def painting(self):
+        """Holds the painter on the GPU for a run of `paint` calls.
+
+        With every model resident, matting or LaMa on a large picture would
+        not fit in 8GB, so the painter only visits.
+        """
+        painter = self._load_painter()
+        with self.gpu:
+            visiting = self.device.type == "cuda" and painter.device.type != "cuda"
+            if visiting:
+                painter.to(self.device)
+            try:
+                yield
+            finally:
+                if visiting:
+                    painter.to("cpu")
+                    torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def paint(
+        self, rgb: np.ndarray, hole: np.ndarray, prompt: str, avoid: str, strength: float = 1.0, seed: int = 0
+    ) -> np.ndarray:
+        """`rgb` with `hole` drawn anew to suit `prompt`. Sides must be multiples of 8.
+
+        Below a strength of 1 the drawing starts from what `rgb` holds in the hole.
+        """
+        from PIL import Image
+
+        painter = self._load_painter()
+        height, width = rgb.shape[:2]
+        with self.painting():
+            result = painter(
+                prompt=prompt,
+                negative_prompt=avoid,
+                image=Image.fromarray(rgb),
+                mask_image=Image.fromarray(hole.astype(np.uint8) * 255),
+                height=height,
+                width=width,
+                strength=strength,
+                num_inference_steps=max(PAINT_STEPS, round(PAINT_STEPS / strength)),
+                guidance_scale=PAINT_GUIDANCE,
+                generator=torch.Generator(self.device).manual_seed(seed),
+                output_type="np",
+            ).images[0]
+        return np.clip(result * 255 + 0.5, 0, 255).astype(np.uint8)
 
     # ------------------------------------------------------------------
     # ViTMatte

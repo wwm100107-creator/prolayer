@@ -9,6 +9,7 @@ because decontamination solves I = aF + (1-a)B and needs B from the inpaint.
 """
 from __future__ import annotations
 
+import logging
 import math
 import uuid
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from .models import engine
 
 Detail = Literal["coarse", "medium", "fine"]
 Progress = Callable[[str, float], None]
+
+log = logging.getLogger("prolayer")
 
 ALPHA_MIN = 0.02
 # Fraction of the image perimeter a mask must cover to count as background.
@@ -68,6 +71,27 @@ FILL_MIN_PIXELS = 64
 FILL_MIN_SHARE = 0.01
 EVEN_AREA_STD = 8.0
 CONTACT_SHADE = 0.06
+MAX_REDRAWN = 6
+# Pieces of one shape: how evenly coloured, how much of the space between them
+# other things must cover, and how much of it may be open page.
+EVEN_SHARE = 0.9
+CUT_SHARE = 0.6
+GAP_OPEN = 0.15
+INTRUDES = 0.15
+# Soft edges reach this far past SAM's outline.
+FRINGE_REACH = 4
+# An even area claims the hidden part of its hull unless this much of the hull shows something else.
+HULL_FOREIGN = 0.15
+# Panels, blobs and ellipses are near convex, so their hull may guess more.
+SURFACE_HULL_EXPLAINS = 0.8
+# A mask this thin in its own bounding box is a handful of scattered specks.
+SCATTERED_FILL = 0.02
+# A shape counts as cut when its completed outline reaches this far under another
+# layer, and clearly more of it shows than is hidden.
+CUT_SEEN = 1.5
+CUT_MIN_PIXELS = 64
+CUT_MIN_SHARE = 0.02
+PHOTO_HULL_EXPLAINS = 0.9
 LEARNED_COLOUR_SCALE = 0.04
 # Holes at least this share of the picture get their colour from a smooth fill.
 LARGE_HOLE = 0.03
@@ -575,6 +599,188 @@ def _merge_same_colour(rgb: np.ndarray, shapes: list[np.ndarray]) -> list[np.nda
     return [mask for mask, _ in merged]
 
 
+def _is_scattered(mask: np.ndarray) -> bool:
+    x0, y0, x1, y1 = _bbox(mask)
+    if mask.sum() >= SCATTERED_FILL * (x1 - x0) * (y1 - y0):
+        return False
+    return cv2.connectedComponents(mask[y0:y1, x0:x1].astype(np.uint8), connectivity=8)[0] > 2
+
+
+def _hull(mask: np.ndarray) -> np.ndarray:
+    hull = np.zeros(mask.shape, np.uint8)
+    points = cv2.findNonZero(mask.astype(np.uint8))
+    if points is not None:
+        cv2.fillConvexPoly(hull, cv2.convexHull(points), 1)
+    return hull > 0
+
+
+def _join_cut_pieces(
+    rgb: np.ndarray, masks: list[np.ndarray], page: np.ndarray, word_ids: set[int]
+) -> list[np.ndarray]:
+    """One evenly coloured shape that something in front cuts apart is one layer again.
+
+    The pieces match in colour, each ends against something else rather than
+    on the open page, and what lies between them is covered, not open page.
+    """
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    masks = list(masks)
+    alive = [id(mask) not in word_ids for mask in masks]
+
+    def describe(mask: np.ndarray) -> tuple[np.ndarray, bool]:
+        values = lab[mask]
+        median = np.median(values, axis=0)
+        return median, float((np.linalg.norm(values - median, axis=1) <= 2 * SHAPE_SAME_COLOUR).mean()) >= EVEN_SHARE
+
+    described = [describe(mask) for mask in masks]
+    hulls = [_hull(mask) for mask in masks]
+
+    def reaches_into(i: int, j: int) -> bool:
+        return bool((hulls[j] & masks[i]).sum() >= INTRUDES * masks[i].sum())
+
+    def is_cut(a: int, b: int, between: np.ndarray) -> bool:
+        """Something lies across the space between two pieces and meets both.
+
+        A piece that lies behind a board stops at the board's edge. A speech
+        bubble that reaches in over the board lies on it, so two bubbles on
+        one board stay two bubbles, however alike.
+        """
+        near_a, near_b = _dilate(masks[a], 2), _dilate(masks[b], 2)
+        covered, meets_both = 0, False
+        for j, other in enumerate(masks):
+            if j in (a, b) or not alive[j] or reaches_into(a, j) or reaches_into(b, j):
+                continue
+            covered += int((other & between).sum())
+            meets_both = meets_both or bool((near_a & other).any() and (near_b & other).any())
+        return meets_both and covered >= CUT_SHARE * between.sum()
+
+    changed = True
+    while changed:
+        changed = False
+        order = sorted((i for i in range(len(masks)) if alive[i]), key=lambda i: int(masks[i].sum()))
+        for b in order:
+            colour, even = described[b]
+            if not even:
+                continue
+            for a in reversed(order):
+                if a == b or not alive[a] or masks[a].sum() < masks[b].sum():
+                    continue
+                other_colour, other_even = described[a]
+                if other_even:
+                    if float(np.linalg.norm(colour - other_colour)) > SHAPE_SAME_COLOUR:
+                        continue
+                    between = _hull(masks[a] | masks[b]) & ~masks[a] & ~masks[b]
+                    if not between.any() or (between & page).sum() > GAP_OPEN * between.sum():
+                        continue
+                    if not is_cut(a, b, between):
+                        continue
+                else:
+                    continue
+                log.debug("join piece of %d px into %d px", masks[b].sum(), masks[a].sum())
+                masks[a] = masks[a] | masks[b]
+                described[a], hulls[a] = describe(masks[a]), _hull(masks[a])
+                alive[b] = False
+                changed = True
+                break
+            if changed:
+                break
+    return [mask for mask, live in zip(masks, alive) if live] + [m for m in masks if id(m) in word_ids]
+
+
+def _order_by_cuts(visible: list[np.ndarray], word_ids: set[int]) -> list[np.ndarray]:
+    """Moves a layer below the one that cuts into its shape.
+
+    A rectangle with a corner missing, or a disc with a straight side, lies
+    behind whatever fills the missing part. Size says nothing about that.
+    """
+    from .complete import known_shape
+
+    # Only other layers can cut a shape; a soft edge left between two masks cannot.
+    others = np.logical_or.reduce(visible)
+    order = list(range(len(visible)))
+    shapes: dict[int, np.ndarray] = {}
+    for i, mask in enumerate(visible):
+        if id(mask) in word_ids:
+            continue
+        # A hull proves nothing here: on a busy picture something lies behind every gap.
+        # Lines printed on a card show the layer below through it, yet cut nothing off it.
+        shape = known_shape(mask, others & ~mask, None) & ~_fill_interior(mask)
+        if shape.sum() >= max(CUT_MIN_PIXELS, CUT_MIN_SHARE * mask.sum()) and mask.sum() >= CUT_SEEN * shape.sum():
+            shapes[i] = shape
+    below: list[tuple[int, int]] = []
+    for a, shape in shapes.items():
+        for b, mask in enumerate(visible):
+            if b == a or id(mask) in word_ids:
+                continue
+            # What lies within a panel's outline lies on the panel, never behind it.
+            if (_hull(mask) & visible[a]).sum() >= NESTED_SHARE * visible[a].sum():
+                continue
+            under = int((shape & mask).sum())
+            back = int((shapes[b] & visible[a]).sum()) if b in shapes else 0
+            if under >= max(CUT_MIN_PIXELS, CUT_MIN_SHARE * visible[a].sum()) and under > 2 * back:
+                below.append((a, b))
+    # Each pass fixes at least one broken pair; a cycle of evidence stops it.
+    for _ in range(len(below) * 2):
+        moved = False
+        for a, b in below:
+            if order.index(a) > order.index(b):
+                order.remove(a)
+                order.insert(order.index(b), a)
+                moved = True
+        if not moved:
+            break
+    return [visible[i] for i in order]
+
+
+def _claim_fringe(visible: list[np.ndarray], page: np.ndarray, word_ids: set[int]) -> list[np.ndarray]:
+    """Soft edges and outlines just past each mask go to the nearest mask.
+
+    Left as crumbs they would count as something lying on top of the object,
+    and the object would grow an opaque rim to reach under them.
+    """
+    owner = np.full(page.shape, -1, np.int32)
+    for z, mask in enumerate(visible):
+        owner[mask] = z
+    free = owner < 0
+    if not free.any() or free.all():
+        return visible
+    distance, labels = cv2.distanceTransformWithLabels(
+        free.astype(np.uint8), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
+    )
+    by_label = np.full(int(labels.max()) + 1, -1, np.int32)
+    by_label[labels[~free]] = owner[~free]
+    nearest = by_label[labels]
+    fringe = free & ~page & (distance <= FRINGE_REACH)
+    # A word was trimmed to its line on purpose, so it keeps its outline.
+    grown = [mask if id(mask) in word_ids else mask | (fringe & (nearest == z)) for z, mask in enumerate(visible)]
+    # A scrap shut inside one layer's outline is part of that layer: the smallest such layer.
+    left = free & ~page & ~fringe
+    if left.any():
+        for z in sorted(range(len(grown)), key=lambda z: int(grown[z].sum())):
+            if id(grown[z]) in word_ids:
+                continue
+            inside = left & _fill_interior(grown[z])
+            if inside.any():
+                grown[z] = grown[z] | inside
+                left &= ~inside
+    return grown
+
+
+def _seal(rgba: np.ndarray, sealable: np.ndarray) -> np.ndarray:
+    """Closes pinholes and slits inside a layer where nothing should show through."""
+    solid = rgba[..., 3] > 128
+    holes = _fill_interior(solid) & ~solid & sealable
+    if not holes.any():
+        return rgba
+    rgba = rgba.copy()
+    _, labels = cv2.distanceTransformWithLabels((~solid).astype(np.uint8), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    by_label = np.zeros((int(labels.max()) + 1, 3), np.uint8)
+    by_label[labels[solid]] = rgba[..., :3][solid]
+    empty = holes & (rgba[..., 3] == 0)
+    rgba[..., :3][empty] = by_label[labels[empty]]
+    rgba[..., 3][holes] = 255
+    return rgba
+
+
 def _crumbs(page: np.ndarray, visible: list[np.ndarray]) -> np.ndarray | None:
     """Strokes and specks too small to stand alone, kept off the background."""
     leftovers = ~page & ~_dilate(np.logical_or.reduce(visible), GAP_MARGIN)
@@ -810,23 +1016,6 @@ def _fill_interior(mask: np.ndarray) -> np.ndarray:
     return filled > 0
 
 
-def _occluded_hull(mask: np.ndarray, upper: np.ndarray) -> np.ndarray:
-    """The hull of a shape cut by something on top, if the shape is near convex.
-
-    Rectangles, discs and plates complete well this way. For anything else the
-    hull would invent area, so the test requires that what is hidden explains
-    nearly all of the difference between the shape and its hull.
-    """
-    points = cv2.findNonZero(mask.astype(np.uint8))
-    hull_mask = np.zeros(mask.shape, np.uint8)
-    if points is None:
-        return hull_mask > 0
-    cv2.fillConvexPoly(hull_mask, cv2.convexHull(points), 1)
-    hull = hull_mask > 0
-    completed = (mask | (hull & upper)).sum()
-    return hull if completed >= 0.95 * hull.sum() else np.zeros(mask.shape, bool)
-
-
 def decompose(
     rgb: np.ndarray,
     embeddings,
@@ -835,6 +1024,7 @@ def decompose(
     edge: float = 1.0,
     with_shadows: bool = False,
     progress: Progress = lambda stage, value: None,
+    redraw: bool = True,
 ) -> tuple[list[Layer], np.ndarray]:
     """Split a whole picture into layers, returned bottom to top."""
     height, width = rgb.shape[:2]
@@ -860,12 +1050,15 @@ def decompose(
             selected = _absorb_nested(selected, regions, found_in_gaps)
         selected.sort(key=lambda mask: -int(mask.sum()))
 
-    from . import scene
+    from . import recognise, scene
 
     progress("Đang nhận diện vật thể", 0.3)
     understood = scene.understand(rgb)
     min_pixels = max(32, int(pixels * 0.0003))
     names: dict[int, str] = {}
+    crumbs = None
+    # What each layer shows, in English, for the model that redraws hidden parts.
+    whats: dict[int, str] = {}
     word_ids: set[int] = set()
     photo = page is None and understood is not None
     if photo:
@@ -875,13 +1068,20 @@ def decompose(
         for z, index in enumerate(pieces):
             owner[_upsample(logits[index], width, height)] = z
         cells = [owner == z for z in range(len(pieces))]
-        masks, layer_names = scene.photo_layers(understood, objects, cells, detail, max_layers)
+        masks, layer_names, layer_whats = scene.photo_layers(understood, objects, cells, detail, max_layers)
         visible = []
-        for mask, name in zip(masks, layer_names):
+        for mask, name, what in zip(masks, layer_names, layer_whats):
             mask = _clean_visible(mask, min_pixels)
             if mask.sum() >= min_pixels:
                 visible.append(mask)
                 names[id(mask)] = name
+                if what is not None:
+                    whats[id(mask)] = what
+        # Objects Mask2Former had no class for get a second look.
+        unnamed = [mask for mask in visible if whats.get(id(mask)) == ""]
+        for mask, found in zip(unnamed, recognise.recognise(rgb, unnamed)):
+            if found is not None:
+                whats[id(mask)], names[id(mask)] = "a " + found[0], found[1]
     else:
         # Every pixel belongs to exactly one layer: the top-most mask covering it.
         # Masks are ordered big to small, so small elements end up on top.
@@ -894,15 +1094,33 @@ def decompose(
         visible, word_ids = _group_words(rgb, visible)
         if page is not None and detail != "fine":
             visible = _merge_parts(rgb, visible, regions, page, found_in_gaps)
+            visible = _join_cut_pieces(rgb, visible, page, word_ids)
             # Too small to be worth a row in the layer list: crumbs picks them up.
-            visible = [mask for mask in visible if mask.sum() >= pixels * GAP_MIN_AREA]
+            visible = [mask for mask in visible if mask.sum() >= pixels * GAP_MIN_AREA and not _is_scattered(mask)]
         if page is not None:
-            # Figures stand in front of the panels and ellipses around them.
-            visible.sort(key=lambda mask: not _is_surface(mask, regions, found_in_gaps))
-        crumbs = None if page is None else _crumbs(page, visible)
+            # Figures stand in front of the panels and ellipses around them. Among
+            # those, the one that reaches around the others lies furthest back.
+            reach = {id(mask): int(_hull(mask).sum()) for mask in visible}
+            visible.sort(
+                key=lambda mask: (0, -reach[id(mask)]) if _is_surface(mask, regions, found_in_gaps) else (1, 0)
+            )
+        if page is not None:
+            visible = _claim_fringe(visible, page, word_ids)
+            visible = _order_by_cuts(visible, word_ids)
+            crumbs = _crumbs(page, visible)
         if crumbs is not None:
             visible.append(crumbs)
         names = scene.name_flat_layers(understood, visible)
+        if page is not None:
+            drawn_things = [mask for mask in visible if id(mask) not in word_ids and mask is not crumbs]
+            known = dict(zip(map(id, drawn_things), recognise.recognise(rgb, drawn_things)))
+            for mask in drawn_things:
+                found = known[id(mask)]
+                if found is not None:
+                    names.setdefault(id(mask), found[1])
+                # Figures have hidden parts worth drawing; panels and words do not.
+                if detail != "fine" and not _is_surface(mask, regions, found_in_gaps):
+                    whats[id(mask)] = scene.what_is(understood, mask) or ("a " + found[0] if found else "")
     if with_shadows and len(visible) > 1:
         from . import shadow
 
@@ -962,8 +1180,47 @@ def decompose(
     uppers: list[np.ndarray] = []
     for mask in reversed(visible):
         uppers.append(above.copy())
-        above |= mask
+        # Crumbs are scraps of every layer, not a thing that lies on top of them.
+        if mask is not crumbs:
+            above |= mask
     uppers.reverse()
+    # On a plain page, what belongs to no layer and is not page is a leftover scrap.
+    unowned = ~page & ~np.logical_or.reduce(visible) if page is not None else np.zeros((height, width), bool)
+
+    # Layers that share a name are told apart by number.
+    shared = {name for name in names.values() if list(names.values()).count(name) > 1}
+    seen_names: dict[str, int] = {}
+    for mask in visible:
+        name = names.get(id(mask))
+        if name in shared:
+            seen_names[name] = seen_names.get(name, 0) + 1
+            names[id(mask)] = f"{name} {seen_names[name]}"
+
+    # The largest hidden parts are drawn by the model; it is slow, so not all.
+    redrawn: set[int] = set()
+    if redraw and whats:
+        from . import complete
+
+        sizes = {
+            i: complete.hidden_size(mask, upper)
+            for i, (mask, upper) in enumerate(zip(visible, uppers))
+            if id(mask) in whats
+        }
+        redrawn = {i for i in sorted(sizes, key=lambda i: -sizes[i])[:MAX_REDRAWN] if sizes[i]}
+    hidden_parts: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    if redrawn:
+        with engine.painting():
+            for count, i in enumerate(sorted(redrawn)):
+                progress("Đang vẽ lại phần bị che", 0.77 + 0.03 * count / len(redrawn))
+                mask = visible[i]
+                near = _dilate(mask, 3)
+                in_front = ", ".join(
+                    sorted({whats[id(m)][2:] for m in visible[i + 1 :] if whats.get(id(m)) and (near & m).any()})
+                )
+                style = "flat" if page is not None else "photo"
+                drawn = complete.complete(rgb, mask, uppers[i], whats[id(mask)], style, in_front)
+                if drawn is not None and drawn[0].any():
+                    hidden_parts[i] = drawn
 
     # Bottom to top: `under` is the picture so far, the B for decontamination.
     layers: list[Layer] = []
@@ -987,12 +1244,34 @@ def decompose(
                 surface=page is not None and _is_surface(mask, regions, found_in_gaps),
             )
 
+        if i in hidden_parts:
+            rgba, x0, y0 = _add_hidden(rgba, x0, y0, *hidden_parts[i])
+        if id(mask) not in word_ids and mask is not crumbs:
+            # Only the page, the background and lower layers may show through a layer.
+            sealable = (mask | upper | unowned)[y0 : y0 + rgba.shape[0], x0 : x0 + rgba.shape[1]]
+            rgba = _seal(rgba, sealable)
+
         layer = _trim(rgba, x0, y0, names.get(id(mask), f"Phần tử {i + 1}"))
         layer.is_word = id(mask) in word_ids
         layers.append(layer)
         _composite(under, layer)
 
     return layers, background
+
+
+def _add_hidden(
+    rgba: np.ndarray, left: int, top: int, where: np.ndarray, picture: np.ndarray
+) -> tuple[np.ndarray, int, int]:
+    """Put a redrawn hidden part into a layer, growing the layer to hold it."""
+    height, width = rgba.shape[:2]
+    bx0, by0, bx1, by1 = _bbox(where)
+    x0, y0, x1, y1 = min(left, bx0), min(top, by0), max(left + width, bx1), max(top + height, by1)
+    out = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+    out[top - y0 : top - y0 + height, left - x0 : left - x0 + width] = rgba
+    local_where = where[y0:y1, x0:x1]
+    out[..., :3][local_where] = picture[y0:y1, x0:x1][local_where]
+    out[..., 3][local_where] = 255
+    return out, x0, y0
 
 
 def _continue_colours(rgb: np.ndarray, source: np.ndarray, area: np.ndarray) -> np.ndarray:
@@ -1021,6 +1300,19 @@ def _continue_colours(rgb: np.ndarray, source: np.ndarray, area: np.ndarray) -> 
     by_label[labels[clean]] = colours[clean]
     painted = rgb.copy()
     painted[area] = by_label[labels[area]]
+    # A panel in a frame: each even area claims the hidden part of its own hull,
+    # the smallest first, so the panel stays a rectangle and the frame keeps the rest.
+    claimed = np.zeros(area.shape, bool)
+    for label in sorted(np.flatnonzero(large), key=lambda label: stats[label, cv2.CC_STAT_AREA]):
+        part = parts == label
+        if float(rgb[part].std(axis=0).max()) > EVEN_AREA_STD:
+            continue
+        hull = _hull(part)
+        foreign = hull & source & ~_dilate(part, 2) & ~claimed
+        if foreign.sum() <= HULL_FOREIGN * hull.sum():
+            mine = area & hull & ~claimed
+            painted[mine] = np.median(rgb[part], axis=0)
+            claimed |= hull
     # The cells of the nearest-colour map meet in hard steps; soften them only.
     softened = cv2.GaussianBlur(painted, (0, 0), 0.7)
     painted[area] = softened[area]
@@ -1053,7 +1345,13 @@ def _extend_under(
     box = _bbox(mask)
     grow = max(2, radius)
     seam = _dilate(mask, grow) & _dilate(upper, grow)
-    hull = _occluded_hull(mask, upper)
+    # A photographed outline is rougher than a drawn one, so its hull fits less tightly.
+    hull = np.zeros(mask.shape, bool)
+    if upper.any() and mask.any():
+        from .complete import known_shape
+
+        explains = (SURFACE_HULL_EXPLAINS if surface else 0.95) if flat else PHOTO_HULL_EXPLAINS
+        hull = known_shape(mask, upper, explains)
     interior = (_fill_interior(mask | seam) | hull) & upper & ~mask
     pure = mask
     if flat:

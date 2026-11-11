@@ -292,6 +292,7 @@ class DecomposeRequest(BaseModel):
     edge: float = Field(1.0, ge=0.2, le=4.0)
     text: bool = True
     shadow: bool = True
+    redraw: bool = True
 
 
 @app.post("/api/sessions/{session_id}/decompose")
@@ -315,7 +316,8 @@ def decompose(session_id: str, request: DecomposeRequest) -> dict:
                 ensure_embeddings(session)
                 embeddings = session.embeddings
             layers, background = pipeline.decompose(
-                source, embeddings, request.detail, request.max_layers, request.edge, request.shadow, report
+                source, embeddings, request.detail, request.max_layers, request.edge, request.shadow, report,
+                request.redraw,
             )
             if request.text:
                 report("Đang đọc lại chữ đã tách", 0.99)
