@@ -12,12 +12,22 @@ from typing import Callable, Sequence
 import cv2
 import numpy as np
 import torch
-from transformers import Sam2ImageProcessor, Sam2Model, VitMatteForImageMatting, VitMatteImageProcessor
+from transformers import (
+    AutoImageProcessor,
+    AutoModelForDepthEstimation,
+    Mask2FormerForUniversalSegmentation,
+    Sam2ImageProcessor,
+    Sam2Model,
+    VitMatteForImageMatting,
+    VitMatteImageProcessor,
+)
 
 log = logging.getLogger("prolayer")
 
 SAM2_ID = os.environ.get("PROLAYER_SAM2", "facebook/sam2.1-hiera-large")
 VITMATTE_ID = os.environ.get("PROLAYER_VITMATTE", "hustvl/vitmatte-base-composition-1k")
+PANOPTIC_ID = os.environ.get("PROLAYER_PANOPTIC", "facebook/mask2former-swin-large-coco-panoptic")
+DEPTH_ID = os.environ.get("PROLAYER_DEPTH", "depth-anything/Depth-Anything-V2-Small-hf")
 LAMA_URL = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
 LAMA_MD5 = "e3aa4aaa15225a33ec84f9f4bc47e500"
 LAMA_PATH = Path.home() / ".cache" / "prolayer" / "models" / "big-lama.pt"
@@ -26,6 +36,9 @@ SAM_SIZE = 1024
 MATTE_MAX_SIDE = 1280
 INPAINT_MAX_SIDE = 1536
 MIN_RETRY_SIDE = 512
+# Mask2Former was evaluated at a shortest side of 800.
+PANOPTIC_SIZE = {"shortest_edge": 800, "longest_edge": 1333}
+PANOPTIC_THRESHOLD = 0.5
 GRID_SIDE = 32
 GRID_BATCH = 64
 
@@ -59,6 +72,10 @@ class Engine:
         self._matte_processor = None
         self._lama = None
         self._ocr = None
+        self._panoptic = None
+        self._panoptic_processor = None
+        self._depth = None
+        self._depth_processor = None
         self.error: str | None = None
 
     # ------------------------------------------------------------------
@@ -69,6 +86,8 @@ class Engine:
             self._load_sam()
             self._load_matte()
             self._load_lama()
+            self._load_panoptic()
+            self._load_depth()
             self._load_ocr()
         except Exception as error:  # surfaced to the UI through /api/health
             log.exception("Model preload failed")
@@ -101,6 +120,21 @@ class Engine:
             if self._lama is None:
                 self._lama = torch.jit.load(str(_download_lama()), map_location=self.device).eval()
         return self._lama
+
+    def _load_panoptic(self):
+        with self.gpu:
+            if self._panoptic is None:
+                self._panoptic_processor = AutoImageProcessor.from_pretrained(PANOPTIC_ID)
+                model = Mask2FormerForUniversalSegmentation.from_pretrained(PANOPTIC_ID).to(self.device).eval()
+                self._panoptic = model.half() if self.device.type == "cuda" else model
+        return self._panoptic
+
+    def _load_depth(self):
+        with self.gpu:
+            if self._depth is None:
+                self._depth_processor = AutoImageProcessor.from_pretrained(DEPTH_ID)
+                self._depth = AutoModelForDepthEstimation.from_pretrained(DEPTH_ID).to(self.device).eval()
+        return self._depth
 
     def _load_ocr(self):
         with self.gpu:
@@ -223,6 +257,46 @@ class Engine:
             kept_points.append(point_ids[keep].cpu().numpy())
             progress(min(1.0, (start + len(batch)) / total))
         return np.concatenate(kept_logits), np.concatenate(kept_scores), np.concatenate(kept_points)
+
+    # ------------------------------------------------------------------
+    # Scene understanding
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def panoptic(self, rgb: np.ndarray) -> tuple[np.ndarray, list[dict]]:
+        """Segment ids per pixel (-1 where nothing was found) and, per id,
+        its COCO label, whether it is a countable thing, and the confidence."""
+        model = self._load_panoptic()
+        height, width = rgb.shape[:2]
+        with self.gpu:
+            inputs = self._panoptic_processor(images=rgb, size=PANOPTIC_SIZE, return_tensors="pt").to(self.device)
+            outputs = model(pixel_values=inputs.pixel_values.to(model.dtype), pixel_mask=inputs.pixel_mask)
+            outputs.class_queries_logits = outputs.class_queries_logits.float()
+            outputs.masks_queries_logits = outputs.masks_queries_logits.float()
+            result = self._panoptic_processor.post_process_panoptic_segmentation(
+                outputs, threshold=PANOPTIC_THRESHOLD, target_sizes=[(height, width)], label_ids_to_fuse=set()
+            )[0]
+        segmentation = result["segmentation"].cpu().numpy().astype(np.int32)
+        segments = [
+            {
+                "id": int(info["id"]),
+                "label": model.config.id2label[info["label_id"]],
+                # COCO panoptic lists the 80 things before the 53 stuff classes.
+                "thing": info["label_id"] < 80,
+                "score": float(info["score"]),
+            }
+            for info in result["segments_info"]
+        ]
+        return segmentation, segments
+
+    @torch.inference_mode()
+    def depth(self, rgb: np.ndarray) -> np.ndarray:
+        """Relative inverse depth: larger is nearer."""
+        model = self._load_depth()
+        height, width = rgb.shape[:2]
+        with self.gpu:
+            inputs = self._depth_processor(images=rgb, return_tensors="pt").to(self.device)
+            predicted = model(**inputs).predicted_depth[0].float().cpu().numpy()
+        return cv2.resize(predicted, (width, height), interpolation=cv2.INTER_LINEAR)
 
     # ------------------------------------------------------------------
     # ViTMatte

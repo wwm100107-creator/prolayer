@@ -89,17 +89,18 @@ def main(out_dir: Path) -> None:
     start = time.perf_counter()
     mask, score = engine.predict_mask(rgb, embeddings, [(520.0, 470.0)], [1], None)
     decoded = time.perf_counter()
-    layer, background = pipeline.extract_element(rgb, rgb.copy(), mask, "circle")
+    extracted, background = pipeline.extract_element(rgb, rgb.copy(), mask, "circle")
+    layer = extracted[-1]
     print(
         f"click: score={score:.3f} area={mask.sum()} decode={decoded - start:.3f}s "
         f"extract={time.perf_counter() - decoded:.2f}s box=({layer.left},{layer.top},{layer.rgba.shape[1]},{layer.rgba.shape[0]}) "
-        f"psnr={psnr(pipeline.flatten(background, [layer]), rgb):.2f}",
+        f"psnr={psnr(pipeline.flatten(background, extracted), rgb):.2f}",
         flush=True,
     )
     # Red must not leak into the repaired background.
     disc = np.hypot(*np.mgrid[:rgb.shape[0], :rgb.shape[1]][::-1] - np.array([470, 470])[:, None, None]) < 130
     print("background mean inside former circle (RGB):", background[disc].mean(0).round(1).tolist())
-    sheet = contact_sheet(rgb, background, [layer], columns=3)
+    sheet = contact_sheet(rgb, background, extracted, columns=3)
     cv2.imwrite(str(out_dir / "click.png"), cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
 
 

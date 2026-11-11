@@ -67,6 +67,11 @@ LEARNED_FILL_MIN = 64
 FILL_MIN_PIXELS = 64
 FILL_MIN_SHARE = 0.01
 EVEN_AREA_STD = 8.0
+CONTACT_SHADE = 0.06
+LEARNED_COLOUR_SCALE = 0.04
+# Holes at least this share of the picture get their colour from a smooth fill.
+LARGE_HOLE = 0.03
+CONTACT_KEEP = 0.5
 FRINGE = 2
 
 # What a run of letters looks like, relative to its line height.
@@ -286,7 +291,25 @@ def inpaint_region(image: np.ndarray, hole: np.ndarray) -> np.ndarray:
     if box is not None:
         context = max(64, int(max(box[2] - box[0], box[3] - box[1]) * 0.6))
         x0, y0, x1, y1 = _pad_box(box, context, width, height)
-        out[y0:y1, x0:x1] = engine.inpaint(out[y0:y1, x0:x1], needs_lama[y0:y1, x0:x1])
+        region, local = out[y0:y1, x0:x1], needs_lama[y0:y1, x0:x1]
+        filled = engine.inpaint(region, local)
+        if local.sum() >= LARGE_HOLE * hole.size:
+            filled = _keep_colour(filled, _smooth_fill(region, ~hole[y0:y1, x0:x1]), local)
+        out[y0:y1, x0:x1] = filled
+    return out
+
+
+def _keep_colour(learned: np.ndarray, base: np.ndarray, area: np.ndarray) -> np.ndarray:
+    """LaMa's texture over the colour a smooth fill gives.
+
+    Across a large hole LaMa drifts toward grey and dark; the smooth fill from
+    the surrounding pixels holds the colour those pixels actually have.
+    """
+    sigma = max(3.0, max(learned.shape[:2]) * LEARNED_COLOUR_SCALE)
+    learned_f = learned.astype(np.float32)
+    corrected = learned_f + cv2.GaussianBlur(base.astype(np.float32), (0, 0), sigma) - cv2.GaussianBlur(learned_f, (0, 0), sigma)
+    out = learned.copy()
+    out[area] = np.clip(corrected[area] + 0.5, 0, 255).astype(np.uint8)
     return out
 
 
@@ -837,16 +860,37 @@ def decompose(
             selected = _absorb_nested(selected, regions, found_in_gaps)
         selected.sort(key=lambda mask: -int(mask.sum()))
 
-    # Every pixel belongs to exactly one layer: the top-most mask covering it.
-    # Masks are ordered big to small, so small elements end up on top.
-    owner = np.full((height, width), -1, np.int16)
-    for z, mask in enumerate(selected):
-        owner[mask] = z
+    from . import scene
+
+    progress("Đang nhận diện vật thể", 0.3)
+    understood = scene.understand(rgb)
     min_pixels = max(32, int(pixels * 0.0003))
-    visible = [_clean_visible(owner == z, min_pixels) for z in range(len(selected))]
-    visible = [mask for mask in visible if mask.sum() >= min_pixels]
+    names: dict[int, str] = {}
     word_ids: set[int] = set()
-    if visible:
+    photo = page is None and understood is not None
+    if photo:
+        objects = [_upsample(logits[i], width, height) for i in select_masks(logits, scores, point_ids, "medium", 80)]
+        pieces = select_masks(logits, scores, point_ids, "fine", 200)
+        owner = np.full((height, width), -1, np.int16)
+        for z, index in enumerate(pieces):
+            owner[_upsample(logits[index], width, height)] = z
+        cells = [owner == z for z in range(len(pieces))]
+        masks, layer_names = scene.photo_layers(understood, objects, cells, detail, max_layers)
+        visible = []
+        for mask, name in zip(masks, layer_names):
+            mask = _clean_visible(mask, min_pixels)
+            if mask.sum() >= min_pixels:
+                visible.append(mask)
+                names[id(mask)] = name
+    else:
+        # Every pixel belongs to exactly one layer: the top-most mask covering it.
+        # Masks are ordered big to small, so small elements end up on top.
+        owner = np.full((height, width), -1, np.int16)
+        for z, mask in enumerate(selected):
+            owner[mask] = z
+        visible = [_clean_visible(owner == z, min_pixels) for z in range(len(selected))]
+        visible = [mask for mask in visible if mask.sum() >= min_pixels]
+    if visible and not photo:
         visible, word_ids = _group_words(rgb, visible)
         if page is not None and detail != "fine":
             visible = _merge_parts(rgb, visible, regions, page, found_in_gaps)
@@ -858,6 +902,7 @@ def decompose(
         crumbs = None if page is None else _crumbs(page, visible)
         if crumbs is not None:
             visible.append(crumbs)
+        names = scene.name_flat_layers(understood, visible)
     if with_shadows and len(visible) > 1:
         from . import shadow
 
@@ -942,7 +987,7 @@ def decompose(
                 surface=page is not None and _is_surface(mask, regions, found_in_gaps),
             )
 
-        layer = _trim(rgba, x0, y0, f"Phần tử {i + 1}")
+        layer = _trim(rgba, x0, y0, names.get(id(mask), f"Phần tử {i + 1}"))
         layer.is_word = id(mask) in word_ids
         layers.append(layer)
         _composite(under, layer)
@@ -987,7 +1032,7 @@ def _learned_fill(rgb: np.ndarray, source: np.ndarray, area: np.ndarray) -> np.n
     if int(area.sum()) < LEARNED_FILL_MIN or not source.any():
         return _continue_colours(rgb, source, area)
     # Everything that is not this object is unknown, so nothing else can leak in.
-    return engine.inpaint(rgb, ~source)
+    return _keep_colour(engine.inpaint(rgb, ~source), _smooth_fill(rgb, source), area)
 
 
 def _extend_under(
@@ -1005,13 +1050,13 @@ def _extend_under(
     so that moving the top element does not expose a hole in this one.
     """
     rgba = rgba.copy()
+    box = _bbox(mask)
     grow = max(2, radius)
     seam = _dilate(mask, grow) & _dilate(upper, grow)
     hull = _occluded_hull(mask, upper)
     interior = (_fill_interior(mask | seam) | hull) & upper & ~mask
     pure = mask
     if flat:
-        box = _bbox(mask)
         reach = max(4, int(max(box[2] - box[0], box[3] - box[1]) * (CLOSING_REACH if surface else FIGURE_REACH)))
         if not hull.any():
             # Closing bridges what covers the shape without growing it elsewhere.
@@ -1028,7 +1073,12 @@ def _extend_under(
 
     if interior.any():
         # Filled from this layer's own pixels only, never from what lies on top.
-        painted = _continue_colours(rgb, pure, interior) if flat else _learned_fill(rgb, mask, interior)
+        if not flat:
+            # In a photo the object on top shades what it rests on: learn from beyond that.
+            shaded = _dilate(upper, max(3, int(max(box[2] - box[0], box[3] - box[1]) * CONTACT_SHADE)))
+            if (mask & ~shaded).sum() >= CONTACT_KEEP * mask.sum():
+                pure = mask & ~shaded
+        painted = _continue_colours(rgb, pure, interior) if flat else _learned_fill(rgb, pure, interior)
         rgba[..., :3][interior] = painted[interior]
         rgba[..., 3][interior] = 255
 
